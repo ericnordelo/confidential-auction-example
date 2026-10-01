@@ -1,0 +1,223 @@
+-- Shared setup and small actions. Each public flow below uses these helpers
+-- to keep its transaction order visible without repeating registry plumbing.
+module Flows.Support where
+
+import Daml.Script
+import DA.Action (foldlA)
+import DA.Time (addRelTime, days, hours, minutes, milliseconds)
+import Splice.Api.Token.HoldingV2 qualified as H
+import Splice.TokenStandard.Utils (accountParties)
+import OpenZeppelin.TokenCIP112V1.Registry
+import OpenZeppelin.TokenCIP112V1.Holding
+import OpenZeppelin.TokenCIP112V1.Allocation
+import OpenZeppelin.TokenCIP112V1.D1
+import Auction.Types
+import Auction.Assets
+import Auction.Eligibility
+import Auction.Workflow
+import Flows.Fixtures
+
+data Env = Env with
+    terms : Terms
+    issuerProvider : Party
+    alice : Party
+    aliceProvider : Party
+    bob : Party
+    carol : Party
+    outsider : Party
+    attester : Party
+    grants : [(GrantKind, ContractId Grant)]
+    disclosures : [Disclosure]
+    start : Time
+
+grant : Env -> GrantKind -> ContractId Grant
+grant e kind = case lookup kind e.grants of
+  Some cid -> cid
+  None -> error "missing grant"
+
+-- Every flow allocates fresh identities and bases deadlines on ledger time,
+-- so it also runs against a persistent local Canton ledger with static time.
+setup : Text -> Bool -> Script Env
+setup = setupWith allocateParty
+
+-- Network demonstrations supply an allocator that routes each role to its host.
+setupWith : (Text -> Script Party) -> Text -> Bool -> Script Env
+setupWith allocate prefix requireD1 = do
+  issuer <- allocate (prefix <> "-issuer")
+  issuerProvider <- allocate (prefix <> "-issuer-provider")
+  av <- allocate (prefix <> "-validation")
+  ao <- allocate (prefix <> "-operator")
+  eligibilityProvider <- allocate (prefix <> "-eligibility")
+  cashAdmin <- allocate (prefix <> "-cash-admin")
+  tokenAdmin <- allocate (prefix <> "-token-admin")
+  alice <- allocate (prefix <> "-alice")
+  aliceProvider <- allocate (prefix <> "-alice-provider")
+  bob <- allocate (prefix <> "-bob")
+  carol <- allocate (prefix <> "-carol")
+  outsider <- allocate (prefix <> "-outsider")
+  attester <- allocate (prefix <> "-attester")
+  start <- getTime
+  trusted <- if requireD1 then do
+    cid <- submit tokenAdmin do createCmd $ TrustedAttesterRegistry tokenAdmin [attester] ["approved"]
+    Some disclosure <- queryDisclosure @TrustedAttesterRegistry tokenAdmin cid
+    pure (Some cid, [disclosure])
+    else pure (None, [])
+  let rules admin required = TokenRules admin (days 1) (hours 1) (hours 1) required (hours 1) None (Some [av])
+  cashRules <- submit cashAdmin do createCmd (rules cashAdmin None)
+  tokenRules <- submit tokenAdmin do createCmd (rules tokenAdmin trusted._1)
+  Some cashDisclosure <- queryDisclosure @TokenRules cashAdmin cashRules
+  Some tokenDisclosure <- queryDisclosure @TokenRules tokenAdmin tokenRules
+  grants <- forA [Preparation, Opening, Admission, Closing, Clearing, Termination, Recovery] $ \kind -> do
+    cid <- submit av do createCmd Grant with av; ao; kind
+    pure (kind, cid)
+  let terms = Terms with
+        issuer; av; ao; eligibilityProvider; cashAdmin; tokenAdmin; cashRules; tokenRules
+        settlementAttester = if requireD1 then Some attester else None
+        cashInstrument = "USD"
+        tokenInstrument = "ISSUE"
+        inventory = H.Account (Some issuer) (Some issuerProvider) "inventory"
+        proceeds = H.Account (Some issuer) (Some issuerProvider) "proceeds"
+        supplyLots = 10
+        lotSize = 10.0
+        reserve = 8.0
+        priceTick = 1.0
+        paymentQuantum = 0.01
+        biddingDeadline = addRelTime start (minutes 10)
+        settlementDeadline = addRelTime start (minutes 20)
+        maxBids = 16
+        maxBatch = 8
+  pure Env with
+    terms; issuerProvider; alice; aliceProvider; bob; carol; outsider; attester; grants
+    disclosures = cashDisclosure :: tokenDisclosure :: trusted._2
+    start
+
+bidTerms : Env -> Party -> Int -> Decimal -> BidTerms
+bidTerms e owner lots maxPrice =
+  let provider = if owner == e.alice then Some e.aliceProvider else None
+  in BidTerms owner (H.Account (Some owner) provider "payment") (H.Account (Some owner) provider "delivery") lots maxPrice
+
+-- Fixture funding collects account consent separately, including across hosts.
+-- The operator never submits with a bidder's or token admin's actAs authority.
+mint : Env -> Bool -> H.Account -> Decimal -> Script (ContractId H.Holding, Disclosure)
+mint e cash account amount = do
+  let t = e.terms
+      admin = if cash then t.cashAdmin else t.tokenAdmin
+      rules = if cash then t.cashRules else t.tokenRules
+  request <- submit admin do
+    createCmd MintConsent with
+      admin; account; amount; rules; approved = []
+      instrument = if cash then t.cashInstrument else t.tokenInstrument
+  consent <- foldlA (\cid approver -> do
+    awaitVisible approver cid
+    submit approver do exerciseCmd cid ApproveMint with approver) request (accountParties admin account)
+  awaitVisible admin consent
+  cid <- submit (actAs admin <> discloseMany e.disclosures) do exerciseCmd consent MintFixture
+  Some disclosure <- queryDisclosure @TokenHolding admin cid
+  pure (toInterfaceContractId cid, disclosure)
+
+-- The issuer and its provider sign in separate transactions. Only the final
+-- funding transaction needs the holding disclosure, then ao submits alone.
+prepareRound : Env -> Script (ContractId Proposal, AllocationId)
+prepareRound e = do
+  p0 <- submit (actAs e.terms.ao <> readAs e.terms.av) do exerciseCmd (grant e Preparation) StartRound with terms = e.terms
+  p1 <- submit e.terms.issuer do exerciseCmd p0 ApproveRound with approver = e.terms.issuer
+  p2 <- submit e.issuerProvider do exerciseCmd p1 ApproveRound with approver = e.issuerProvider
+  (holding, disclosure) <- mint e False e.terms.inventory (intToDecimal e.terms.supplyLots * e.terms.lotSize)
+  proposal <- submit (actAs e.terms.ao <> readAs e.terms.av <> discloseMany (disclosure :: e.disclosures)) do
+    exerciseCmd p2 FundRound with inputs = [holding]
+  Some p <- queryContractId e.terms.av proposal
+  pure (proposal, p.lock.root)
+
+openRound : Env -> Script (ContractId Round, ContractId PublishedTerms, AllocationId)
+openRound e = do
+  (proposal, supply) <- prepareRound e
+  (round, published) <- submit (actAs e.terms.ao <> readAs e.terms.av) do exerciseCmd (grant e Opening) OpenRound with proposal; supply
+  pure (round, published, supply)
+
+-- Each bid has its own preparation state, consent transactions and payment
+-- input. Preparing these bids does not consume the shared round contract.
+prepareBid : Env -> ContractId PublishedTerms -> BidTerms -> Script AdmissionInput
+prepareBid e published bid = do
+  Some pDisclosure <- queryDisclosure @PublishedTerms e.terms.av published
+  p <- submit (actAs e.terms.ao <> readAs e.terms.av <> discloseMany [pDisclosure]) do
+    exerciseCmd (grant e Preparation) StartBid with published; bid
+  signed <- foldlA (\cid approver -> do
+    awaitVisible approver cid
+    submit approver do exerciseCmd cid ApproveBid with approver) p (bidParties e.terms bid)
+  (holding, disclosure) <- mint e True bid.payment (paymentFor e.terms bid.lots bid.maxPrice)
+  awaitVisible e.terms.ao signed
+  prepared <- submit (actAs e.terms.ao <> readAs e.terms.av <> discloseMany (disclosure :: e.disclosures)) do
+    exerciseCmd signed FundBid with inputs = [holding]
+  Some b <- queryContractId e.terms.av prepared
+  credential <- submit e.terms.eligibilityProvider do
+    createCmd $ Credential e.terms.eligibilityProvider bid.bidder e.terms.av None (addRelTime e.start (hours 1)) False
+  pure AdmissionInput with prepared; currentLock = b.lock.root; credential
+
+acceptBatch : Env -> ContractId Round -> AllocationId -> [AdmissionInput] -> Script (ContractId Round)
+acceptBatch e round supply bids = submit (actAs e.terms.ao <> readAs e.terms.av) do
+  exerciseCmd (grant e Admission) AcceptBatch with round; supply; bids
+
+closeRound : Env -> ContractId Round -> Script (ContractId Round)
+closeRound e round = do
+  setTime e.terms.biddingDeadline
+  submit (actAs e.terms.ao <> readAs e.terms.av) do exerciseCmd (grant e Closing) CloseRound with round
+
+-- This helper models operator computation. Round_Clear recomputes the result
+-- itself and rejects a changed proposal. Updated evidence can be supplied later.
+clearInput : Env -> ContractId Round -> AllocationId -> [AdmissionInput] -> Script ClearInput
+clearInput e round supply inputs = do
+  Some r <- queryContractId e.terms.av round
+  bids <- forA (zip r.accepted inputs) $ \(accepted, i) -> do
+    Some b <- queryContractId e.terms.av accepted
+    Some c <- queryContractId e.terms.av i.credential
+    Some a <- queryContractId e.terms.av (fromInterfaceContractId @TokenAllocation i.currentLock)
+    now <- getTime
+    let exclusion = if a.d2SeizureHook /= None then Some "payment lock marked"
+                    else if c.revoked then Some "credential revoked"
+                    else if now >= c.validUntil then Some "credential expired" else None
+    pure (ClearEvidence accepted i.currentLock i.credential, Quote b.number b.bid.lots b.bid.maxPrice exclusion)
+  pure ClearInput with
+    bids = map fst bids; supply
+    proposed = computeResult e.terms (map snd bids)
+    approval = None; cashArgs = extra; tokenArgs = extra
+
+clearRound : Env -> ContractId Round -> ClearInput -> Script (ContractId ClearedRound)
+clearRound e round input = submit (actAs e.terms.ao <> readAs e.terms.av <> discloseMany e.disclosures) do
+  exerciseCmd (grant e Clearing) ClearRound with round; input
+
+-- Query the account's total, separating freely usable and locked holdings.
+balance : Party -> H.Account -> Text -> Bool -> Script Decimal
+balance owner account instrument locked = do
+  holdings <- query @TokenHolding owner
+  pure (sum [h.holding.amount | (_, h) <- holdings, h.holding.account == account,
+             h.holding.instrumentId.id == instrument, (h.holding.lock /= None) == locked])
+
+assertActive : (Template t, HasEnsure t) => Party -> ContractId t -> Script ()
+assertActive party cid = do
+  Some _ <- queryContractId party cid
+  pure ()
+
+assertGone : (Template t, HasEnsure t) => Party -> ContractId t -> Script ()
+assertGone party cid = do
+  result <- queryContractId party cid
+  case result of None -> pure (); Some _ -> abort "contract should have been consumed"
+
+-- A submitter's completion does not mean every remote observer has indexed
+-- the contract. Await its local visibility before the next party acts on it.
+awaitValue : Text -> Script (Optional a) -> Script a
+awaitValue = awaitValueLoop 300
+
+awaitValueLoop : Int -> Text -> Script (Optional a) -> Script a
+awaitValueLoop 0 label _ = abort ("visibility timeout: " <> label)
+awaitValueLoop attempts label queryAction = do
+  result <- queryAction
+  case result of
+    Some value -> pure value
+    None -> do
+      sleep (milliseconds 100)
+      awaitValueLoop (attempts - 1) label queryAction
+
+awaitVisible : (Template t, HasEnsure t) => Party -> ContractId t -> Script ()
+awaitVisible party cid = do
+  _ <- awaitValue (show cid) (queryContractId party cid)
+  pure ()

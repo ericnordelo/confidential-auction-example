@@ -1,0 +1,531 @@
+module Auction.Workflow where
+
+import DA.Optional (fromOptional)
+
+import DA.Foldable (forA_)
+import DA.List (dedupSort)
+import Splice.Api.Token.HoldingV2 qualified as H
+import Splice.Api.Token.AllocationV2 qualified as A
+import Splice.Api.Token.MetadataV1
+import Splice.TokenStandard.Utils (toAnyContractId, senderSide, receiverSide)
+import Auction.Types
+import Auction.Assets
+import Auction.Eligibility
+
+data GrantKind = Preparation | Opening | Admission | Closing | Clearing | Termination | Recovery
+  deriving (Eq, Show)
+
+data Phase = Open | Closed
+  deriving (Eq, Show)
+
+-- One template, separate contract instances. Revoking Admission does not
+-- revoke Clearing or Recovery. There is no arbitrary-choice forwarding API.
+template Grant with
+    av : Party
+    ao : Party
+    kind : GrantKind
+  where
+    signatory av
+    observer ao
+
+    nonconsuming choice StartRound : ContractId RoundPreparation
+      with terms : Terms
+      controller ao
+      do
+        checkGrant this Preparation terms
+        assertMsg "invalid round terms" (validTerms terms)
+        create $ RoundPreparation terms None []
+
+    nonconsuming choice StartBid : ContractId BidPreparation
+      with published : ContractId PublishedTerms; bid : BidTerms
+      controller ao
+      do
+        p <- fetch published
+        checkGrant this Preparation p.terms
+        assertMsg "invalid bid" (validBid p.terms bid)
+        before p.terms.biddingDeadline
+        create $ BidPreparation p.terms p.roundId bid None []
+
+    nonconsuming choice OpenRound : (ContractId Round, ContractId PublishedTerms)
+      with proposal : ContractId Proposal; supply : AllocationId
+      controller ao
+      do
+        p <- fetch proposal
+        checkGrant this Opening p.terms
+        exercise proposal Proposal_Open with supply
+
+    nonconsuming choice AcceptBatch : ContractId Round
+      with round : ContractId Round; bids : [AdmissionInput]; supply : AllocationId
+      controller ao
+      do
+        r <- fetch round
+        checkGrant this Admission r.terms
+        exercise round Round_AcceptBatch with bids; supply
+
+    nonconsuming choice CloseRound : ContractId Round
+      with round : ContractId Round
+      controller ao
+      do
+        r <- fetch round
+        checkGrant this Closing r.terms
+        exercise round Round_Close
+
+    nonconsuming choice ClearRound : ContractId ClearedRound
+      with round : ContractId Round; input : ClearInput
+      controller ao
+      do
+        r <- fetch round
+        checkGrant this Clearing r.terms
+        exercise round Round_Clear with input
+
+    nonconsuming choice EndRound : ContractId EndedRound
+      with round : ContractId Round; expired : Bool; reason : Text
+      controller ao
+      do
+        r <- fetch round
+        checkGrant this Termination r.terms
+        exercise round Round_End with expired; reason
+
+    nonconsuming choice Release : [ContractId H.Holding]
+      with ticket : ContractId RecoveryTicket; current : AllocationId
+      controller ao
+      do
+        t <- fetch ticket
+        assertMsg "wrong recovery grant" (kind == Recovery && t.av == av && t.ao == ao)
+        exercise ticket Recover with current
+
+    nonconsuming choice CloseUnsettledBid : ContractId Outcome
+      with ended : ContractId EndedRound; bid : ContractId AcceptedBid
+      controller ao
+      do
+        r <- fetch ended
+        checkGrant this Recovery r.terms
+        exercise ended Ended_CloseBid with bid
+
+    nonconsuming choice CloseUnsettledSupply : ContractId RecoveryTicket
+      with ended : ContractId EndedRound
+      controller ao
+      do
+        r <- fetch ended
+        checkGrant this Recovery r.terms
+        exercise ended Ended_CloseSupply
+
+checkGrant : Grant -> GrantKind -> Terms -> Update ()
+checkGrant g kind t = assertMsg "wrong grant" (g.kind == kind && g.av == t.av && g.ao == t.ao)
+
+before : Time -> Update ()
+before deadline = do
+  now <- getTime
+  assertMsg "deadline reached" (now < deadline)
+
+-- Each approval consumes the current state. Its signatories accumulate the
+-- exact account parties whose consent the later funding choice will need.
+template RoundPreparation with
+    terms : Terms
+    identity : Optional AnyContractId
+    approved : [Party]
+  where
+    signatory terms.av, approved
+    observer terms.ao, issuerParties terms
+    ensure validTerms terms && all (`elem` issuerParties terms) approved && approved == dedupSort approved
+
+    choice ApproveRound : ContractId RoundPreparation
+      with approver : Party
+      controller approver
+      do
+        assertMsg "not an outstanding approver" (approver `elem` issuerParties terms && approver `notElem` approved)
+        create this with identity = Some (fromOptional (toAnyContractId self) identity); approved = dedupSort (approver :: approved)
+
+    choice FundRound : ContractId Proposal
+      with inputs : [ContractId H.Holding]
+      controller terms.ao
+      do
+        assertMsg "missing issuer account consent" (approved == issuerParties terms)
+        before terms.biddingDeadline
+        lock <- createLock terms.tokenRules terms.tokenAdmin terms.inventory terms.tokenInstrument
+          (intToDecimal terms.supplyLots * terms.lotSize) terms.av terms.settlementDeadline
+          (fromOptional (toAnyContractId self) identity) inputs
+        sale <- create $ SaleAuthority terms None lock
+        create $ Proposal terms sale lock
+
+    choice AbandonRoundPreparation : ()
+      controller terms.issuer
+      do pure ()
+
+template Proposal with
+    terms : Terms
+    sale : ContractId SaleAuthority
+    lock : LockBinding
+  where
+    signatory terms.issuer, terms.av
+    observer terms.ao
+
+    choice Proposal_Open : (ContractId Round, ContractId PublishedTerms)
+      with supply : AllocationId
+      controller terms.av
+      do
+        before terms.biddingDeadline
+        a <- checkLock lock supply
+        assertMsg "supply is marked" (a.d2SeizureHook == None)
+        bound <- exercise sale BindSale with roundId = self
+        round <- create $ Round terms self bound lock Open [] 0
+        published <- create $ PublishedTerms terms self
+        pure (round, published)
+
+    choice AbandonProposal : ContractId RecoveryTicket
+      controller terms.issuer
+      do exercise sale AbandonSale
+
+template PublishedTerms with
+    terms : Terms
+    roundId : ContractId Proposal
+  where
+    signatory terms.issuer, terms.av
+    observer terms.ao
+
+template BidPreparation with
+    terms : Terms
+    roundId : ContractId Proposal
+    bid : BidTerms
+    identity : Optional AnyContractId
+    approved : [Party]
+  where
+    signatory terms.av, approved
+    observer terms.issuer, terms.ao, bidParties terms bid
+    ensure validBid terms bid && all (`elem` bidParties terms bid) approved && approved == dedupSort approved
+
+    choice ApproveBid : ContractId BidPreparation
+      with approver : Party
+      controller approver
+      do
+        assertMsg "not an outstanding approver" (approver `elem` bidParties terms bid && approver `notElem` approved)
+        create this with identity = Some (fromOptional (toAnyContractId self) identity); approved = dedupSort (approver :: approved)
+
+    choice FundBid : ContractId PreparedBid
+      with inputs : [ContractId H.Holding]
+      controller terms.ao
+      do
+        assertMsg "missing bidder account consent" (approved == bidParties terms bid)
+        before terms.biddingDeadline
+        lock <- createLock terms.cashRules terms.cashAdmin bid.payment terms.cashInstrument
+          (paymentFor terms bid.lots bid.maxPrice) terms.av terms.settlementDeadline
+          (fromOptional (toAnyContractId self) identity) inputs
+        create $ PreparedBid terms roundId bid lock
+
+    choice AbandonBidPreparation : ()
+      controller bid.bidder
+      do pure ()
+
+template PreparedBid with
+    terms : Terms
+    roundId : ContractId Proposal
+    bid : BidTerms
+    lock : LockBinding
+  where
+    signatory terms.av, bidParties terms bid
+    observer terms.issuer, terms.ao
+
+    choice Prepared_Accept : ContractId AcceptedBid
+      with number : Int; credentialRoot : ContractId Credential
+      controller terms.issuer, terms.av
+      do create $ AcceptedBid terms roundId bid lock number credentialRoot
+
+    choice WithdrawPreparedBid : ContractId RecoveryTicket
+      controller bid.bidder
+      do ticketFor terms (bidParties terms bid) lock "unaccepted bid abandoned"
+
+data AdmissionInput = AdmissionInput with
+    prepared : ContractId PreparedBid
+    currentLock : AllocationId
+    credential : ContractId Credential
+  deriving (Eq, Show)
+
+data ClearEvidence = ClearEvidence with
+    accepted : ContractId AcceptedBid
+    currentLock : AllocationId
+    credential : ContractId Credential
+  deriving (Eq, Show)
+
+data ClearInput = ClearInput with
+    bids : [ClearEvidence]
+    supply : AllocationId
+    proposed : Result
+    approval : Optional (ContractId BatchApproval)
+    cashArgs : ExtraArgs
+    tokenArgs : ExtraArgs
+  deriving (Eq, Show)
+
+template Round with
+    terms : Terms
+    roundId : ContractId Proposal
+    sale : ContractId SaleAuthority
+    supplyLock : LockBinding
+    phase : Phase
+    accepted : [ContractId AcceptedBid]
+    nextNumber : Int
+  where
+    signatory terms.issuer, terms.av
+    observer terms.ao
+    ensure nextNumber == length accepted && nextNumber <= terms.maxBids && length (dedupSort accepted) == length accepted
+
+    choice Round_AcceptBatch : ContractId Round
+      with bids : [AdmissionInput]; supply : AllocationId
+      controller terms.av
+      do
+        assertMsg "round is closed" (phase == Open)
+        before terms.biddingDeadline
+        assertMsg "invalid batch size" (not (null bids) && length bids <= terms.maxBatch && nextNumber + length bids <= terms.maxBids)
+        assertMsg "duplicate prepared bid" (length (dedupSort (map (.prepared) bids)) == length bids)
+        a <- checkLock supplyLock supply
+        assertMsg "supply is marked" (a.d2SeizureHook == None)
+        new <- forA (zip [nextNumber..nextNumber + length bids - 1] bids) $ \(number, input) -> do
+          p <- fetch input.prepared
+          assertMsg "wrong bid round or terms" (p.roundId == roundId && p.terms == terms && validBid terms p.bid)
+          allocation <- checkLock p.lock input.currentLock
+          assertMsg "payment lock is marked" (allocation.d2SeizureHook == None)
+          (root, exclusion) <- checkCredential terms.eligibilityProvider p.bid.bidder terms.av None input.credential
+          assertMsg "bidder not eligible" (exclusion == None)
+          exercise input.prepared Prepared_Accept with number; credentialRoot = root
+        create this with accepted = accepted <> new; nextNumber = nextNumber + length new
+
+    choice Round_Close : ContractId Round
+      controller terms.av
+      do
+        now <- getTime
+        assertMsg "round cannot close yet" (phase == Open && now >= terms.biddingDeadline)
+        create this with phase = Closed
+
+    choice Round_Clear : ContractId ClearedRound
+      with input : ClearInput
+      controller terms.av
+      do
+        assertMsg "round must be closed" (phase == Closed)
+        before terms.settlementDeadline
+        assertMsg "accepted list changed" (map (.accepted) input.bids == accepted)
+        supply <- checkLock supplyLock input.supply
+        assertMsg "supply is marked" (supply.d2SeizureHook == None)
+        verified <- forA (zip [0..length input.bids - 1] input.bids) $ \(number, e) -> do
+          b <- fetch e.accepted
+          assertMsg "accepted record mismatch" (b.terms == terms && b.roundId == roundId && b.number == number)
+          allocation <- checkLock b.lock e.currentLock
+          (_, excluded) <- checkCredential terms.eligibilityProvider b.bid.bidder terms.av (Some b.credentialRoot) e.credential
+          let exclusion = if allocation.d2SeizureHook /= None then Some "payment lock marked" else excluded
+          pure (b, Quote number b.bid.lots b.bid.maxPrice exclusion)
+        let result = computeResult terms (map snd verified)
+            settlement = settlementFor terms (toAnyContractId roundId)
+            winners = [(b.bid, f) | ((b, _), f) <- zip verified result.fills, f.lots > 0]
+            payments = map (\(b, f) -> paymentLeg terms b f) winners
+            deliveries = map (\(b, f) -> deliveryLeg terms b f) winners
+        assertMsg "incorrect proposed clearing result" (input.proposed == result)
+        -- Each child sees only its own result. The complete list remains here.
+        finished <- forA (zip input.bids result.fills) $ \(e, fill) ->
+          exercise e.accepted FinalizeBid with current = e.currentLock; fill; price = result.price
+        (issuerCash, issuerToken) <- exercise sale FinalizeSale with current = input.supply; price = result.price; payments; deliveries
+        -- A full-reference approval closes the cid/meta gap in the pinned D1
+        -- experiment. Registry D1 checks still execute in the factory below.
+        forA_ terms.settlementAttester $ \attester -> do
+          approval <- case input.approval of
+            None -> abort "missing exact auction approval"
+            Some cid -> pure cid
+          a <- fetch approval
+          assertMsg "wrong settlement attester" (a.attester == attester)
+          exercise approval VerifyBatch with expected = settlement; expectedPayments = payments; expectedDeliveries = deliveries
+        -- Both registries execute inside this one parent transaction. A token
+        -- factory failure rolls back even an already-executed cash factory.
+        settle terms.cashRules terms.av settlement payments (concatMap (.cash) finished <> issuerCash) input.cashArgs
+        settle terms.tokenRules terms.av settlement deliveries (concatMap (.token) finished <> issuerToken) input.tokenArgs
+        create $ ClearedRound terms roundId result (map (.outcome) finished)
+
+    choice Round_End : ContractId EndedRound
+      with expired : Bool; reason : Text
+      controller terms.av
+      do
+        now <- getTime
+        assertMsg "reason required" (reason /= "")
+        assertMsg "expiry claimed too early" (not expired || now >= terms.settlementDeadline)
+        create $ EndedRound terms roundId sale accepted reason
+
+data FinalizedBid = FinalizedBid with
+    cash : [AllocationId]
+    token : [AllocationId]
+    outcome : ContractId Outcome
+  deriving (Eq, Show)
+
+template AcceptedBid with
+    terms : Terms
+    roundId : ContractId Proposal
+    bid : BidTerms
+    lock : LockBinding
+    number : Int
+    credentialRoot : ContractId Credential
+  where
+    signatory terms.issuer, terms.av, bidParties terms bid
+    observer terms.ao
+
+    choice FinalizeBid : FinalizedBid
+      with current : AllocationId; fill : Fill; price : Decimal
+      controller terms.av
+      do
+        before terms.settlementDeadline
+        assertMsg "invalid local fill" (fill.number == number && fill.lots >= 0 && fill.lots <= bid.lots)
+        assertMsg "invalid local price or payment" (price >= terms.reserve && (fill.lots == 0 || price <= bid.maxPrice)
+          && fill.payment == paymentFor terms fill.lots price && fill.payment <= paymentFor terms bid.lots bid.maxPrice)
+        _ <- checkLock lock current
+        let settlement = settlementFor terms (toAnyContractId roundId)
+        (cash, token, recovery) <- if fill.lots == 0
+          then do
+            ticket <- ticketFor terms (bidParties terms bid) lock "zero fill"
+            pure ([], [], Some ticket)
+          else do
+            assertMsg "excluded bid cannot win" (fill.exclusion == None)
+            released <- cancel terms.av current
+            cash <- allocate terms.cashRules settlement
+              (mkSpec terms.cashAdmin bid.payment terms.settlementDeadline [senderSide (paymentLeg terms bid fill)]) released
+            token <- allocate terms.tokenRules settlement
+              (mkSpec terms.tokenAdmin bid.delivery terms.settlementDeadline [receiverSide (deliveryLeg terms bid fill)]) []
+            pure ([cash], [token], None)
+        outcome <- create $ Outcome terms.av terms.issuer terms.ao (bidParties terms bid) roundId number fill recovery
+        pure FinalizedBid with cash; token; outcome
+
+    choice CloseBidWithoutSale : ContractId Outcome
+      with reason : Text
+      controller terms.av
+      do
+        ticket <- ticketFor terms (bidParties terms bid) lock reason
+        create $ Outcome terms.av terms.issuer terms.ao (bidParties terms bid) roundId number (Fill number 0 0.0 (Some reason)) (Some ticket)
+
+template SaleAuthority with
+    terms : Terms
+    boundRound : Optional (ContractId Proposal)
+    lock : LockBinding
+  where
+    signatory terms.av, issuerParties terms
+    observer terms.ao
+
+    choice BindSale : ContractId SaleAuthority
+      with roundId : ContractId Proposal
+      controller terms.av
+      do
+        assertMsg "sale already bound" (boundRound == None)
+        create this with boundRound = Some roundId
+
+    choice AbandonSale : ContractId RecoveryTicket
+      controller terms.av
+      do
+        assertMsg "sale is bound to a round" (boundRound == None)
+        ticketFor terms (issuerParties terms) lock "proposal abandoned"
+
+    choice FinalizeSale : ([AllocationId], [AllocationId])
+      with current : AllocationId; price : Decimal; payments : [A.TransferLeg]; deliveries : [A.TransferLeg]
+      controller terms.av
+      do
+        roundId <- case boundRound of
+          None -> abort "sale not bound"
+          Some cid -> pure cid
+        before terms.settlementDeadline
+        assertMsg "unpaired sale legs" (length payments == length deliveries)
+        assertMsg "price below reserve" (price >= terms.reserve)
+        assertMsg "too much inventory" (sum (map (.amount) deliveries) <= intToDecimal terms.supplyLots * terms.lotSize)
+        forA_ (zip payments deliveries) $ \(p, d) -> do
+          let lots = floor (d.amount / terms.lotSize)
+          assertMsg "invalid delivery" (d.sender == terms.inventory && d.instrumentId == terms.tokenInstrument
+            && lots > 0 && d.amount == intToDecimal lots * terms.lotSize)
+          assertMsg "invalid proceeds" (p.receiver == terms.proceeds && p.instrumentId == terms.cashInstrument
+            && p.sender.owner == d.receiver.owner && p.amount == paymentFor terms lots price)
+        _ <- checkLock lock current
+        released <- cancel terms.av current
+        if null payments then pure ([], []) else do
+          let settlement = settlementFor terms (toAnyContractId roundId)
+          cash <- allocate terms.cashRules settlement
+            (mkSpec terms.cashAdmin terms.proceeds terms.settlementDeadline (map receiverSide payments)) []
+          token <- allocate terms.tokenRules settlement
+            (mkSpec terms.tokenAdmin terms.inventory terms.settlementDeadline (map senderSide deliveries)) released
+          pure ([cash], [token])
+
+    choice CloseSaleWithoutSale : ContractId RecoveryTicket
+      with reason : Text
+      controller terms.av
+      do ticketFor terms (issuerParties terms) lock reason
+
+-- The account parties keep visibility of their own outcome, not the whole book.
+template Outcome with
+    av : Party
+    issuer : Party
+    ao : Party
+    parties : [Party]
+    roundId : ContractId Proposal
+    number : Int
+    fill : Fill
+    recovery : Optional (ContractId RecoveryTicket)
+  where
+    signatory av
+    observer issuer, ao, parties
+
+template ClearedRound with
+    terms : Terms
+    roundId : ContractId Proposal
+    result : Result
+    outcomes : [ContractId Outcome]
+  where
+    signatory terms.issuer, terms.av
+    observer terms.ao
+
+template EndedRound with
+    terms : Terms
+    roundId : ContractId Proposal
+    sale : ContractId SaleAuthority
+    accepted : [ContractId AcceptedBid]
+    reason : Text
+  where
+    signatory terms.issuer, terms.av
+    observer terms.ao
+
+    nonconsuming choice Ended_CloseBid : ContractId Outcome
+      with bid : ContractId AcceptedBid
+      controller terms.av
+      do
+        assertMsg "bid was not accepted" (bid `elem` accepted)
+        exercise bid CloseBidWithoutSale with reason
+
+    nonconsuming choice Ended_CloseSupply : ContractId RecoveryTicket
+      controller terms.av
+      do exercise sale CloseSaleWithoutSale with reason
+
+ticketFor : Terms -> [Party] -> LockBinding -> Text -> Update (ContractId RecoveryTicket)
+ticketFor t parties lock reason = create $ RecoveryTicket t.av t.ao parties lock reason
+
+template RecoveryTicket with
+    av : Party
+    ao : Party
+    parties : [Party]
+    lock : LockBinding
+    reason : Text
+  where
+    signatory av
+    observer ao, parties
+
+    choice Recover : [ContractId H.Holding]
+      with current : AllocationId
+      controller av
+      do
+        _ <- checkLock lock current
+        cancel av current
+
+-- This prototype-specific approval binds the full settlement reference and
+-- separates the two admins' leg sets. It is additional to the registry's D1.
+template BatchApproval with
+    attester : Party
+    settlement : A.SettlementInfo
+    payments : [A.TransferLeg]
+    deliveries : [A.TransferLeg]
+    expiresAt : Time
+  where
+    signatory attester
+    observer settlement.executors
+
+    choice VerifyBatch : ()
+      with expected : A.SettlementInfo; expectedPayments : [A.TransferLeg]; expectedDeliveries : [A.TransferLeg]
+      controller settlement.executors
+      do
+        before expiresAt
+        assertMsg "approval reference or legs mismatch" (expected == settlement && expectedPayments == payments && expectedDeliveries == deliveries)

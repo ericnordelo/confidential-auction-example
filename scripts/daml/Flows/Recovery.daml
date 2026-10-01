@@ -1,0 +1,94 @@
+module Flows.Recovery where
+
+import Daml.Script
+import DA.Assert ((===))
+import DA.Foldable (forA_)
+import DA.List (head)
+import DA.Time (addRelTime, seconds)
+import Splice.Api.Token.AllocationV2 qualified as A
+import Auction.Assets
+import Auction.Workflow
+import Flows.Support
+
+-- A funded bid can miss admission. Being prepared before the cutoff is not
+-- enough: acceptance itself must validate at a ledger time before the cutoff.
+lateBid : Script ()
+lateBid = do
+  e <- setup "late" False
+  (round, published, supply) <- openRound e
+  let bid = bidTerms e e.alice 5 12.0
+  prepared <- prepareBid e published bid
+  setTime e.terms.biddingDeadline
+  submitMustFail (actAs e.terms.ao <> readAs e.terms.av) do
+    exerciseCmd (grant e Admission) AcceptBatch with round; supply; bids = [prepared]
+  assertActive e.terms.av prepared.prepared
+
+  -- The bidder abandons its unaccepted bid. ao can then cancel that exact lock.
+  ticket <- submit e.alice do exerciseCmd prepared.prepared WithdrawPreparedBid
+  _ <- submit (actAs e.terms.ao <> readAs e.terms.av) do exerciseCmd (grant e Recovery) Release with ticket; current = prepared.currentLock
+  balance e.alice bid.payment e.terms.cashInstrument False >>= (=== 600.0)
+  submitMustFail (actAs e.terms.ao <> readAs e.terms.av) do exerciseCmd (grant e Recovery) Release with ticket; current = prepared.currentLock
+
+-- A clear at the settlement deadline is rejected. Ending the round does not
+-- fetch every bid or unlock every account in one transaction.
+missedSettlement : Script ()
+missedSettlement = do
+  e <- setup "expiry" False
+  (r0, published, supply) <- openRound e
+  alice <- prepareBid e published (bidTerms e e.alice 5 12.0)
+  bob <- prepareBid e published (bidTerms e e.bob 8 10.0)
+  r1 <- acceptBatch e r0 supply [alice,bob]
+  closed <- closeRound e r1
+  input <- clearInput e closed supply [alice,bob]
+  Some r <- queryContractId e.terms.av closed
+  setTime e.terms.settlementDeadline
+  submitMustFail (actAs e.terms.ao <> readAs e.terms.av <> discloseMany e.disclosures) do
+    exerciseCmd (grant e Clearing) ClearRound with round = closed; input
+  assertActive e.terms.av closed
+
+  ended <- submit (actAs e.terms.ao <> readAs e.terms.av) do
+    exerciseCmd (grant e Termination) EndRound with round = closed; expired = True; reason = "settlement deadline reached"
+  forA_ (zip r.accepted [alice,bob]) $ \(bid, prepared) -> do
+    outcome <- submit (actAs e.terms.ao <> readAs e.terms.av) do exerciseCmd (grant e Recovery) CloseUnsettledBid with ended; bid
+    Some o <- queryContractId e.terms.av outcome
+    Some ticket <- pure o.recovery
+    _ <- submit (actAs e.terms.ao <> readAs e.terms.av) do exerciseCmd (grant e Recovery) Release with ticket; current = prepared.currentLock
+    pure ()
+  supplyTicket <- submit (actAs e.terms.ao <> readAs e.terms.av) do exerciseCmd (grant e Recovery) CloseUnsettledSupply with ended
+  _ <- submit (actAs e.terms.ao <> readAs e.terms.av) do exerciseCmd (grant e Recovery) Release with ticket = supplyTicket; current = supply
+  balance e.alice (bidTerms e e.alice 5 12.0).payment e.terms.cashInstrument False >>= (=== 600.0)
+  balance e.bob (bidTerms e e.bob 8 10.0).payment e.terms.cashInstrument False >>= (=== 800.0)
+  balance e.terms.issuer e.terms.inventory e.terms.tokenInstrument False >>= (=== 100.0)
+
+-- A committed allocation blocks account withdrawal before its deadline.
+-- After the deadline, the account parties can recover without operator action.
+accountWithdrawal : Script ()
+accountWithdrawal = do
+  e <- setup "withdraw" False
+  (_, published, _) <- openRound e
+  bid <- prepareBid e published (bidTerms e e.alice 5 12.0)
+  let withdraw = A.Allocation_Withdraw [e.alice, e.aliceProvider] extra
+  submitMustFail [e.alice, e.aliceProvider] do exerciseCmd bid.currentLock withdraw
+  setTime (addRelTime e.terms.settlementDeadline (seconds 1))
+  _ <- submit [e.alice, e.aliceProvider] do exerciseCmd bid.currentLock withdraw
+  balance e.alice (bidTerms e e.alice 5 12.0).payment e.terms.cashInstrument False >>= (=== 600.0)
+
+-- A losing bid is finalized without cancelling its allocation in the clear.
+-- An unmarked zero-fill lock can then be released immediately, before expiry.
+zeroFill : Script ()
+zeroFill = do
+  e <- setup "zero" False
+  (r0, published, supply) <- openRound e
+  winner <- prepareBid e published (bidTerms e e.alice 10 12.0)
+  loser <- prepareBid e published (bidTerms e e.bob 5 8.0)
+  r1 <- acceptBatch e r0 supply [winner,loser]
+  closed <- closeRound e r1
+  input <- clearInput e closed supply [winner,loser]
+  _ <- clearRound e closed input
+  outcomes <- query @Outcome e.bob
+  let (_, outcome) = head outcomes
+  outcome.fill.lots === 0
+  balance e.bob (bidTerms e e.bob 5 8.0).payment e.terms.cashInstrument True >>= (=== 400.0)
+  Some ticket <- pure outcome.recovery
+  _ <- submit (actAs e.terms.ao <> readAs e.terms.av) do exerciseCmd (grant e Recovery) Release with ticket; current = loser.currentLock
+  balance e.bob (bidTerms e e.bob 5 8.0).payment e.terms.cashInstrument False >>= (=== 400.0)

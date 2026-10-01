@@ -1,0 +1,43 @@
+module Flows.Audit where
+
+import Daml.Script
+import DA.Assert ((===))
+import DA.Foldable (forA_)
+import DA.List (sortOn)
+import Auction.Workflow
+import Flows.Support
+
+-- Simulate an auditor retaining the closed book before clear. These read-only
+-- checks reconcile membership, ordering, economic results and private outcomes.
+-- A deployment must also retain transaction history and failed-command evidence.
+auditResult : Script ()
+auditResult = do
+  e <- setup "audit" False
+  let t = e.terms
+  (r0, published, supply) <- openRound e
+  inputs <- mapA (prepareBid e published) [bidTerms e e.alice 5 12.0, bidTerms e e.bob 8 10.0, bidTerms e e.carol 4 10.0]
+  admitted <- acceptBatch e r0 supply inputs
+  closed <- closeRound e admitted
+  Some snapshot <- queryContractId t.av closed
+  accepted <- mapA (queryContractId t.av) snapshot.accepted
+  let book = [b | Some b <- accepted]
+  length book === length snapshot.accepted
+  map (.number) book === [0,1,2]
+  forA_ book $ \b -> b.roundId === snapshot.roundId
+
+  input <- clearInput e closed supply inputs
+  resultCid <- clearRound e closed input
+  Some aggregate <- queryContractId t.av resultCid
+  private <- mapA (queryContractId t.av) aggregate.outcomes
+  let outcomes = sortOn (.number) [o | Some o <- private]
+  map (.number) outcomes === [0,1,2]
+  map (.fill) outcomes === aggregate.result.fills
+  -- Hand-calculated figures give this worked example an independent oracle.
+  map (\o -> o.fill.lots) outcomes === [5,4,1]
+  aggregate.result.price === 10.0
+  sum (map (\o -> o.fill.payment) outcomes) === 1000.0
+  balance t.issuer t.proceeds t.cashInstrument False >>= (=== 1000.0)
+
+  -- The eligibility provider cannot query the private book or outcomes.
+  query @AcceptedBid t.eligibilityProvider >>= (\xs -> length xs === 0)
+  query @Outcome t.eligibilityProvider >>= (\xs -> length xs === 0)

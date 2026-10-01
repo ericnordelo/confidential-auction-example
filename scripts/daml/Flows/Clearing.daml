@@ -1,0 +1,61 @@
+module Flows.Clearing where
+
+import Daml.Script
+import DA.Assert ((===))
+import DA.Foldable (forA_)
+import Auction.Types
+import Auction.Workflow
+import Flows.Support
+
+-- The complete worked example: 100 tokens, bids 50@12, 80@10 and 40@10.
+-- Fills are 50,40,10 tokens at price 10, including the marginal-band remainder.
+happyPath : Script ()
+happyPath = do
+  e <- setup "clear" False
+  let t = e.terms
+      a = bidTerms e e.alice 5 12.0
+      b = bidTerms e e.bob 8 10.0
+      c = bidTerms e e.carol 4 10.0
+  -- The issuer and provider approve inventory funding. ao then opens the round.
+  (r0, published, supply) <- openRound e
+  -- Each bidder approves its own terms and account use before ao funds the bid.
+  bids <- mapA (prepareBid e published) [a,b,c]
+  -- One operator transaction admits all three bids and advances the round once.
+  r1 <- acceptBatch e r0 supply bids
+  -- At cutoff, ao closes the book and computes its proposed result off ledger.
+  closed <- closeRound e r1
+  input <- clearInput e closed supply bids
+  input.proposed === Result 10.0 [Fill 0 5 500.0 None, Fill 1 4 400.0 None, Fill 2 1 100.0 None]
+
+  -- The operator cannot supply a different price or an incomplete accepted set.
+  submitMustFail (actAs t.ao <> readAs t.av <> discloseMany e.disclosures) do
+    exerciseCmd (grant e Clearing) ClearRound with round = closed; input = input with proposed = input.proposed with price = 9.0
+  submitMustFail (actAs t.ao <> readAs t.av <> discloseMany e.disclosures) do
+    exerciseCmd (grant e Clearing) ClearRound with round = closed; input = input with bids = []
+
+  -- ao is the only submitter. AcceptedBid and SaleAuthority contribute the
+  -- account signatures to their own nested allocation-factory calls.
+  -- Round_Clear recomputes the result and settles both assets in one transaction.
+  cleared <- clearRound e closed input
+  Some result <- queryContractId t.av cleared
+  result.result === input.proposed
+  forA_ [(a,50.0,100.0),(b,40.0,400.0),(c,10.0,300.0)] $ \(bid, tokens, refund) -> do
+    balance bid.bidder bid.delivery t.tokenInstrument False >>= (=== tokens)
+    balance bid.bidder bid.payment t.cashInstrument False >>= (=== refund)
+    balance bid.bidder bid.payment t.cashInstrument True >>= (=== 0.0)
+  balance t.issuer t.proceeds t.cashInstrument False >>= (=== 1000.0)
+  balance t.issuer t.inventory t.tokenInstrument False >>= (=== 0.0)
+  assertGone t.av closed
+  debug "Atomic clear complete: every cash payment and token delivery committed."
+
+-- No eligible demand still creates one terminal result and returns inventory.
+emptyRound : Script ()
+emptyRound = do
+  e <- setup "empty" False
+  (round, _, supply) <- openRound e
+  closed <- closeRound e round
+  input <- clearInput e closed supply []
+  cleared <- clearRound e closed input
+  Some c <- queryContractId e.terms.av cleared
+  c.result === Result e.terms.reserve []
+  balance e.terms.issuer e.terms.inventory e.terms.tokenInstrument False >>= (=== 100.0)

@@ -1,0 +1,31 @@
+module Flows.Math where
+
+import Daml.Script
+import DA.Assert ((===))
+import DA.Foldable (forA_)
+import Auction.Types
+import Flows.Support
+
+-- Small exhaustive cases check conservation, limits, exclusions and rounding.
+-- Hand-calculated examples check economics independently of the clear helper.
+clearingRules : Script ()
+clearingRules = do
+  e <- setup "math" False
+  let t = e.terms
+  computeResult t [Quote 0 5 12.0 None, Quote 1 8 10.0 None, Quote 2 4 10.0 None]
+    === Result 10.0 [Fill 0 5 500.0 None, Fill 1 4 400.0 None, Fill 2 1 100.0 None]
+  computeResult t [Quote 0 5 12.0 None] === Result 8.0 [Fill 0 5 400.0 None]
+  computeResult t [Quote 0 10 12.0 None] === Result 8.0 [Fill 0 10 800.0 None]
+  computeResult t [Quote 0 20 12.0 (Some "revoked")] === Result 8.0 [Fill 0 0 0.0 (Some "revoked")]
+  let tiny = t with supplyLots = 2; lotSize = 1.0; paymentQuantum = 0.01
+  computeResult tiny [Quote 0 1 10.0 None, Quote 1 1 10.0 None, Quote 2 1 10.0 None]
+    === Result 10.0 [Fill 0 1 10.0 None, Fill 1 1 10.0 None, Fill 2 0 0.0 None]
+  paymentFor (t with lotSize = 0.001) 1 8.0 === 0.01
+
+  forA_ [(s,a,b) | s <- [1..8], a <- [1..8], b <- [1..8]] $ \(s,a,b) -> do
+    let terms = t with supplyLots = s
+        result = computeResult terms [Quote 0 a 12.0 None, Quote 1 b 10.0 None]
+    sum (map (.lots) result.fills) === min s (a+b)
+    forA_ (zip result.fills [a,b]) $ \(fill, requested) -> do
+      assertMsg "fill exceeds demand" (fill.lots >= 0 && fill.lots <= requested)
+      assertMsg "payment exceeds maximum lock" (fill.payment <= paymentFor terms requested 12.0)

@@ -1,0 +1,51 @@
+module Flows.Bidding where
+
+import Daml.Script
+import DA.Assert ((===))
+import DA.List (head)
+import Auction.Workflow
+import Flows.Support
+
+-- Independent preparations precede one atomic update to the shared round.
+-- This demonstrates batching, not a measured throughput improvement.
+batchAcceptance : Script ()
+batchAcceptance = do
+  e <- setup "batch" False
+  (r0, published, supply) <- openRound e
+  alice <- prepareBid e published (bidTerms e e.alice 5 12.0)
+  bob <- prepareBid e published (bidTerms e e.bob 8 10.0)
+  carol <- prepareBid e published (bidTerms e e.carol 4 10.0)
+  Some unchanged <- queryContractId e.terms.av r0
+  unchanged.nextNumber === 0
+
+  -- An invalid second input aborts the first acceptance as well. No number is
+  -- reserved, and all prepared bids remain available for a corrected batch.
+  let wrongBob = bob with currentLock = alice.currentLock
+  submitMustFail (actAs e.terms.ao <> readAs e.terms.av) do
+    exerciseCmd (grant e Admission) AcceptBatch with round = r0; supply; bids = [alice, wrongBob]
+  assertActive e.terms.av alice.prepared
+  assertActive e.terms.av bob.prepared
+  assertActive e.terms.av r0
+
+  r1 <- acceptBatch e r0 supply [alice, bob]
+  Some first <- queryContractId e.terms.av r1
+  first.nextNumber === 2
+  r2 <- acceptBatch e r1 supply [carol]
+  Some second <- queryContractId e.terms.av r2
+  second.nextNumber === 3
+  accepted <- mapA (queryContractId e.terms.av) second.accepted
+  [b.number | Some b <- accepted] === [0, 1, 2]
+
+  -- A consumed round successor cannot admit another batch. The backend must
+  -- serialize submissions and reconcile the current CID before a retry.
+  submitMustFail (actAs e.terms.ao <> readAs e.terms.av) do
+    exerciseCmd (grant e Admission) AcceptBatch with round = r0; supply; bids = [carol]
+
+  -- Bidders can read their own accepted number but cannot query the book or
+  -- another bidder's contract. Multi-host projection tests are separate.
+  assertActive e.alice (head second.accepted)
+  hidden <- queryContractId e.alice r2
+  case hidden of None -> pure (); Some _ -> abort "private round leaked"
+  visible <- query @AcceptedBid e.alice
+  length visible === 1
+  debug "Batched acceptance complete: numbers 0,1 then 2, with no partial admission."

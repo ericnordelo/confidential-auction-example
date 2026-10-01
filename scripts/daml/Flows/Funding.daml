@@ -1,0 +1,35 @@
+module Flows.Funding where
+
+import Daml.Script
+import DA.Assert ((===))
+import Auction.Workflow
+import Flows.Support
+
+-- A missing provider approval and an underfunded input are different failures.
+-- Both leave the preparation available. Successful funding consumes it once.
+fundingGuards : Script ()
+fundingGuards = do
+  e <- setup "funding" False
+  let t = e.terms
+      b = bidTerms e e.alice 5 12.0
+  (round, published, _) <- openRound e
+  p0 <- submit (actAs t.ao <> readAs t.av) do exerciseCmd (grant e Preparation) StartBid with published; bid = b
+  p1 <- submit e.alice do exerciseCmd p0 ApproveBid with approver = e.alice
+  (small, smallDisclosure) <- mint e True b.payment 599.0
+  submitMustFail (actAs t.ao <> readAs t.av <> discloseMany (smallDisclosure :: e.disclosures)) do
+    exerciseCmd p1 FundBid with inputs = [small]
+  p2 <- submit e.aliceProvider do exerciseCmd p1 ApproveBid with approver = e.aliceProvider
+  submitMustFail (actAs t.ao <> readAs t.av <> discloseMany (smallDisclosure :: e.disclosures)) do
+    exerciseCmd p2 FundBid with inputs = [small]
+  assertActive t.av p2
+  balance e.alice b.payment t.cashInstrument True >>= (=== 0.0)
+  balance e.alice b.payment t.cashInstrument False >>= (=== 599.0)
+
+  (rest, restDisclosure) <- mint e True b.payment 1.0
+  prepared <- submit (actAs t.ao <> readAs t.av <> discloseMany ([smallDisclosure,restDisclosure] <> e.disclosures)) do
+    exerciseCmd p2 FundBid with inputs = [small,rest]
+  assertActive t.av prepared
+  balance e.alice b.payment t.cashInstrument True >>= (=== 600.0)
+  assertActive t.av round
+  submitMustFail (actAs t.ao <> readAs t.av <> discloseMany e.disclosures) do
+    exerciseCmd p2 FundBid with inputs = []

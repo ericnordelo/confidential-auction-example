@@ -1,0 +1,30 @@
+module Auction.Eligibility where
+
+import DA.Optional (fromOptional)
+
+-- The provider maintains a consumed-and-recreated status chain. A revocation
+-- leaves explicit evidence. A missing current contract causes validation to fail.
+template Credential with
+    provider : Party
+    owner : Party
+    av : Party
+    root : Optional (ContractId Credential)
+    validUntil : Time
+    revoked : Bool
+  where
+    signatory provider
+    observer owner, av
+
+    choice UpdateStatus : ContractId Credential
+      with newExpiry : Time; newRevoked : Bool
+      controller provider
+      do create this with root = Some (fromOptional self root); validUntil = newExpiry; revoked = newRevoked
+
+checkCredential : Party -> Party -> Party -> Optional (ContractId Credential) -> ContractId Credential -> Update (ContractId Credential, Optional Text)
+checkCredential provider owner av expected cid = do
+  c <- fetch cid
+  assertMsg "credential binding mismatch" (c.provider == provider && c.owner == owner && c.av == av)
+  let root = fromOptional cid c.root
+  assertMsg "credential identity changed" (optional True (== root) expected)
+  now <- getTime
+  pure (root, if c.revoked then Some "credential revoked" else if now >= c.validUntil then Some "credential expired" else None)

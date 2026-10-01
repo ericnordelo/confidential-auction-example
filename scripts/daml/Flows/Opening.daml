@@ -1,0 +1,53 @@
+module Flows.Opening where
+
+import Daml.Script
+import DA.Assert ((===))
+import Auction.Workflow
+import Flows.Support
+
+-- Follow the authority from av, through issuer and provider consent, into
+-- registry funding. No joint submission is used to approve the preparation.
+opening : Script ()
+opening = do
+  e <- setup "opening" False
+  let t = e.terms
+  p0 <- submit (actAs t.ao <> readAs t.av) do exerciseCmd (grant e Preparation) StartRound with terms = t
+
+  -- The operator cannot fund before the issuer and account provider consent.
+  submitMustFail (actAs t.ao <> readAs t.av) do exerciseCmd p0 FundRound with inputs = []
+  p1 <- submit t.issuer do exerciseCmd p0 ApproveRound with approver = t.issuer
+  submitMustFail (actAs t.ao <> readAs t.av) do exerciseCmd p1 FundRound with inputs = []
+  p2 <- submit e.issuerProvider do exerciseCmd p1 ApproveRound with approver = e.issuerProvider
+
+  (holding, disclosure) <- mint e False t.inventory 100.0
+  proposal <- submit (actAs t.ao <> readAs t.av <> discloseMany (disclosure :: e.disclosures)) do
+    exerciseCmd p2 FundRound with inputs = [holding]
+  Some p <- queryContractId t.av proposal
+  balance t.issuer t.inventory t.tokenInstrument True >>= (=== 100.0)
+  balance t.issuer t.inventory t.tokenInstrument False >>= (=== 0.0)
+
+  -- Opening uses issuer authority from Proposal and account authority from
+  -- SaleAuthority. The stable round identity is the consumed proposal's CID.
+  (round, published) <- submit (actAs t.ao <> readAs t.av) do
+    exerciseCmd (grant e Opening) OpenRound with proposal; supply = p.lock.root
+  Some r <- queryContractId t.av round
+  Some terms <- queryContractId t.av published
+  r.roundId === proposal
+  terms.roundId === proposal
+  r.accepted === []
+  r.nextNumber === 0
+
+  -- Reusing the proposal cannot open a second round with the same supply.
+  submitMustFail (actAs t.ao <> readAs t.av) do
+    exerciseCmd (grant e Opening) OpenRound with proposal; supply = p.lock.root
+  debug "Opening complete: separate consent, locked supply, one stable round."
+
+-- Abandoning a funded proposal produces a recovery ticket before any round
+-- exists. Recovery returns inventory to the issuer's original account.
+abandonProposal : Script ()
+abandonProposal = do
+  e <- setup "abandon-proposal" False
+  (proposal, supply) <- prepareRound e
+  ticket <- submit e.terms.issuer do exerciseCmd proposal AbandonProposal
+  _ <- submit (actAs e.terms.ao <> readAs e.terms.av) do exerciseCmd (grant e Recovery) Release with ticket; current = supply
+  balance e.terms.issuer e.terms.inventory e.terms.tokenInstrument False >>= (=== 100.0)

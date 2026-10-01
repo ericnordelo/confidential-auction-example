@@ -1,0 +1,134 @@
+module Auction.Types where
+
+import DA.Optional (fromOptional)
+
+import DA.List (dedupSort, sortOn)
+
+
+import Splice.Api.Token.HoldingV2 qualified as H
+import Splice.Api.Token.AllocationV2 qualified as A
+import Splice.Api.Token.MetadataV1
+import Splice.TokenStandard.Utils (accountParties)
+import OpenZeppelin.TokenCIP112V1.Registry (TokenRules)
+
+-- Fixed terms are copied into each consent contract. Account consent cannot
+-- be redirected later by changing an argument on an operator choice.
+data Terms = Terms with
+    issuer : Party
+    av : Party
+    ao : Party
+    eligibilityProvider : Party
+    settlementAttester : Optional Party
+    cashAdmin : Party
+    tokenAdmin : Party
+    cashRules : ContractId TokenRules
+    tokenRules : ContractId TokenRules
+    cashInstrument : Text
+    tokenInstrument : Text
+    inventory : H.Account
+    proceeds : H.Account
+    supplyLots : Int
+    lotSize : Decimal
+    reserve : Decimal
+    priceTick : Decimal
+    paymentQuantum : Decimal
+    biddingDeadline : Time
+    settlementDeadline : Time
+    maxBids : Int
+    maxBatch : Int
+  deriving (Eq, Show)
+
+data BidTerms = BidTerms with
+    bidder : Party
+    payment : H.Account
+    delivery : H.Account
+    lots : Int
+    maxPrice : Decimal
+  deriving (Eq, Show)
+
+data Quote = Quote with
+    number : Int
+    lots : Int
+    maxPrice : Decimal
+    exclusion : Optional Text
+  deriving (Eq, Show)
+
+data Fill = Fill with
+    number : Int
+    lots : Int
+    payment : Decimal
+    exclusion : Optional Text
+  deriving (Eq, Show)
+
+data Result = Result with
+    price : Decimal
+    fills : [Fill]
+  deriving (Eq, Show)
+
+issuerParties : Terms -> [Party]
+issuerParties t = dedupSort (t.issuer :: accountParties t.tokenAdmin t.inventory <> accountParties t.cashAdmin t.proceeds)
+
+bidParties : Terms -> BidTerms -> [Party]
+bidParties t b = dedupSort (b.bidder :: accountParties t.cashAdmin b.payment <> accountParties t.tokenAdmin b.delivery)
+
+-- Ceiling is applied both to the maximum lock and to the final payment.
+paymentFor : Terms -> Int -> Decimal -> Decimal
+paymentFor t lots price = intToDecimal (ceiling (intToDecimal lots * t.lotSize * price / t.paymentQuantum)) * t.paymentQuantum
+
+validTerms : Terms -> Bool
+validTerms t = t.supplyLots > 0 && t.supplyLots <= 1000000
+  && t.lotSize > 0.0 && t.lotSize <= 1000000.0
+  && t.reserve > 0.0 && t.reserve <= 1000000.0
+  && t.priceTick >= 0.000001 && t.paymentQuantum >= 0.000001
+  && t.reserve / t.priceTick == intToDecimal (ceiling (t.reserve / t.priceTick))
+  && t.inventory.owner == Some t.issuer && t.proceeds.owner == Some t.issuer
+  && t.biddingDeadline < t.settlementDeadline
+  && t.maxBids > 0 && t.maxBids <= 64
+  && t.maxBatch > 0 && t.maxBatch <= t.maxBids
+  && t.cashAdmin /= t.tokenAdmin && t.ao /= t.av
+
+validBid : Terms -> BidTerms -> Bool
+validBid t b = b.payment.owner == Some b.bidder && b.delivery.owner == Some b.bidder
+  && b.bidder /= t.issuer
+  && b.lots > 0 && b.lots <= 1000000
+  && b.maxPrice >= t.reserve && b.maxPrice <= 1000000.0
+  && b.maxPrice / t.priceTick == intToDecimal (ceiling (b.maxPrice / t.priceTick))
+  && intToDecimal b.lots * t.lotSize * b.maxPrice <= 1000000000.0
+
+-- Work in whole lots. Remainders go to earlier accepted bids in the marginal
+-- price band, after each bid receives its proportional floor allocation.
+bandFills : Int -> [Quote] -> [(Int, Int)]
+bandFills supply qs = fillBands qs supply (reverse (dedupSort (map (.maxPrice) qs)))
+
+fillBands : [Quote] -> Int -> [Decimal] -> [(Int, Int)]
+fillBands _ _ [] = []
+fillBands qs remaining (price :: prices) =
+  let band = sortOn (.number) (filter (\q -> q.maxPrice == price) qs)
+      demand = sum (map (.lots) band)
+  in if remaining >= demand
+     then map (\q -> (q.number, q.lots)) band <> fillBands qs (remaining - demand) prices
+     else
+       let base = map (\q -> (q.number, floor (intToDecimal (remaining * q.lots) / intToDecimal demand))) band
+           extra = remaining - sum (map snd base)
+       in zipWith (\i (n, qty) -> (n, qty + (if i < extra then 1 else 0))) [0..length base - 1] base
+
+-- The clear calls this on the closed round's entire accepted list.
+computeResult : Terms -> [Quote] -> Result
+computeResult t qs = Result price (map fill qs)
+  where
+    eligible = filter (\q -> q.exclusion == None) qs
+    amounts = bandFills t.supplyLots eligible
+    amount n = fromOptional 0 (lookup n amounts)
+    winning = filter (\q -> amount q.number > 0) eligible
+    price = if sum (map (.lots) eligible) <= t.supplyLots || null winning
+            then t.reserve else foldl min 1000000.0 (map (.maxPrice) winning)
+    fill q = Fill q.number (amount q.number) (paymentFor t (amount q.number) price) q.exclusion
+
+settlementFor : Terms -> AnyContractId -> A.SettlementInfo
+settlementFor t identity = A.SettlementInfo [t.av] "auction-clear" (Some identity) emptyMetadata
+
+paymentLeg : Terms -> BidTerms -> Fill -> A.TransferLeg
+paymentLeg t b f = A.TransferLeg ("payment-" <> show f.number) b.payment t.proceeds f.payment t.cashInstrument emptyMetadata
+
+deliveryLeg : Terms -> BidTerms -> Fill -> A.TransferLeg
+deliveryLeg t b f = A.TransferLeg ("delivery-" <> show f.number) t.inventory b.delivery (intToDecimal f.lots * t.lotSize) t.tokenInstrument emptyMetadata

@@ -1,0 +1,33 @@
+-- Fixture-only mint consent. It lets parties on different participants fund
+-- their test accounts without pretending one submitter controls every party.
+module Flows.Fixtures where
+
+import DA.List (dedupSort)
+import Splice.Api.Token.HoldingV2 qualified as H
+import Splice.TokenStandard.Utils (accountParties)
+import OpenZeppelin.TokenCIP112V1.Registry
+import OpenZeppelin.TokenCIP112V1.Holding
+
+template MintConsent with
+    admin : Party
+    account : H.Account
+    instrument : Text
+    amount : Decimal
+    rules : ContractId TokenRules
+    approved : [Party]
+  where
+    signatory admin, approved
+    observer accountParties admin account
+
+    choice ApproveMint : ContractId MintConsent
+      with approver : Party
+      controller approver
+      do
+        assertMsg "invalid mint approver" (approver `elem` accountParties admin account && approver `notElem` approved)
+        create this with approved = dedupSort (approver :: approved)
+
+    choice MintFixture : ContractId TokenHolding
+      controller admin
+      do
+        assertMsg "incomplete mint consent" (approved == dedupSort (accountParties admin account))
+        exercise rules TokenRules_Mint with account; amount; instrumentId = instrument; reason = "PoC fixture funding"
