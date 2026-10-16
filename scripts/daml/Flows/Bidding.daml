@@ -3,8 +3,67 @@ module Flows.Bidding where
 import Daml.Script
 import DA.Assert ((===))
 import DA.List (head)
+import Splice.Testing.Tokens.TestTokenV2 (TokenAllocationV2)
 import Auction.Workflow
 import Flows.Support
+
+-- A basic account completes both allocations in one bidder-only submission.
+-- The operator has no part in creation, and the shared round remains active.
+immediateAllocations : Script ()
+immediateAllocations = do
+  e <- setup "immediate" False
+  let t = e.terms
+      b = bidTerms e e.bob 5 12.0
+  (round, published, supply) <- openRound e
+  (holding, _) <- mint e True b.payment 600.0
+  source@(FundedBid prepared) <- submitBid e published b [holding]
+  Some p <- queryContractId t.av prepared
+  assertMsg "bidder consent missing" (e.bob `elem` signatory p)
+  assertMsg "operator became a signatory" (t.ao `notElem` signatory p)
+  assertActive t.av (fromInterfaceContractId @TokenAllocationV2 p.lock.root)
+  assertActive t.av (fromInterfaceContractId @TokenAllocationV2 p.receipt.root)
+  query @BidRequest t.av >>= (\xs -> length xs === 0)
+  Some unchanged <- queryContractId t.av round
+  unchanged.nextNumber === 0
+  balance e.bob b.payment t.cashInstrument True >>= (=== 600.0)
+  -- Admission and clear are still separate, operator-submitted transactions.
+  credential <- issueCredential e e.bob
+  let bid = AdmissionInput source p.lock.root p.receipt.root credential
+  admitted <- acceptBatch e round supply [bid]
+  assertGone t.av prepared
+  closed <- closeRound e admitted
+  input <- clearInput e closed supply [bid]
+  _ <- clearRound e closed input
+  balance e.bob b.delivery t.tokenInstrument False >>= (=== 50.0)
+  balance e.bob b.payment t.cashInstrument False >>= (=== 200.0)
+
+-- Only the bidder can invoke SubmitBid. A live preparation grant and the
+-- bidding deadline also gate creation before any allocation is requested.
+submissionGuards : Script ()
+submissionGuards = do
+  e <- setup "submission-guards" False
+  let t = e.terms
+      b = bidTerms e e.bob 5 12.0
+  (_, published, _) <- openRound e
+  (holding, holdingDisclosure) <- mint e True b.payment 600.0
+  Some publishedDisclosure <- queryDisclosure @PublishedTerms t.av published
+  Some preparationDisclosure <- queryDisclosure @Grant t.av (grant e Preparation)
+  let disclosures = [publishedDisclosure,preparationDisclosure,holdingDisclosure] <> e.staticDisclosures
+      args = SubmitBid (grant e Preparation) b [holding] (cashContext e) (tokenContext e)
+  submitMustFail (actAs t.ao <> readAs t.av <> discloseMany disclosures) do exerciseCmd published args
+  submitMustFail (actAs e.aliceProvider <> discloseMany disclosures) do exerciseCmd published args
+  submitMustFail (actAs e.bob <> discloseMany disclosures) do
+    exerciseCmd published (args with bid = b with maxPrice = 7.0)
+  submit t.av do archiveCmd (grant e Preparation)
+  submitMustFail (actAs e.bob <> discloseMany disclosures) do exerciseCmd published args
+  replacement <- submit t.av do createCmd $ Grant t.av t.ao Preparation
+  Some replacementDisclosure <- queryDisclosure @Grant t.av replacement
+  setTime t.biddingDeadline
+  submitMustFail (actAs e.bob <> discloseMany (replacementDisclosure :: disclosures)) do
+    exerciseCmd published (args with preparation = replacement)
+  balance e.bob b.payment t.cashInstrument True >>= (=== 0.0)
+  query @PreparedBid t.av >>= (\xs -> length xs === 0)
+  query @BidRequest t.av >>= (\xs -> length xs === 0)
 
 -- Independent preparations precede one atomic update to the shared round.
 -- This demonstrates batching, not a measured throughput improvement.
@@ -12,6 +71,8 @@ batchAcceptance : Script ()
 batchAcceptance = do
   e <- setup "batch" False
   (r0, published, supply) <- openRound e
+  Some initialRound <- queryContractId e.terms.av r0
+  let receipt = initialRound.proceedsReceipt.root
   alice <- prepareBid e published (bidTerms e e.alice 5 12.0)
   bob <- prepareBid e published (bidTerms e e.bob 8 10.0)
   carol <- prepareBid e published (bidTerms e e.carol 4 10.0)
@@ -22,9 +83,9 @@ batchAcceptance = do
   -- reserved, and all prepared bids remain available for a corrected batch.
   let wrongBob = bob with currentLock = alice.currentLock
   submitMustFail (actAs e.terms.ao <> readAs e.terms.av) do
-    exerciseCmd (grant e Admission) AcceptBatch with round = r0; supply; bids = [alice, wrongBob]
-  assertActive e.terms.av alice.prepared
-  assertActive e.terms.av bob.prepared
+    exerciseCmd (grant e Admission) AcceptBatch with round = r0; supply; receipt; bids = [alice, wrongBob]
+  assertSourceActive e alice.prepared
+  assertSourceActive e bob.prepared
   assertActive e.terms.av r0
 
   r1 <- acceptBatch e r0 supply [alice, bob]
@@ -39,7 +100,7 @@ batchAcceptance = do
   -- A consumed round successor cannot admit another batch. The backend must
   -- serialize submissions and reconcile the current CID before a retry.
   submitMustFail (actAs e.terms.ao <> readAs e.terms.av) do
-    exerciseCmd (grant e Admission) AcceptBatch with round = r0; supply; bids = [carol]
+    exerciseCmd (grant e Admission) AcceptBatch with round = r0; supply; receipt; bids = [carol]
 
   -- Bidders can read their own accepted number but cannot query the book or
   -- another bidder's contract. Multi-host projection tests are separate.

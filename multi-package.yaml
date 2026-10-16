@@ -1,6 +1,6 @@
 sdk-version: 3.4.11
 
 packages:
-  - vendor/experiments/token/tokenCIP112-v1
+  - vendor/splice-test-token-v2
   - auction
   - scripts

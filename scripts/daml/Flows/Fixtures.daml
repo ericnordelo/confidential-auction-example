@@ -2,11 +2,12 @@
 -- their test accounts without pretending one submitter controls every party.
 module Flows.Fixtures where
 
-import DA.List (dedupSort)
+import DA.List (dedupSort, head)
+import Splice.Api.Token.TransferInstructionV2 qualified as T
+import Splice.Api.Token.MetadataV1 (ExtraArgs)
 import Splice.Api.Token.HoldingV2 qualified as H
 import Splice.TokenStandard.Utils (accountParties)
-import OpenZeppelin.TokenCIP112V1.Registry
-import OpenZeppelin.TokenCIP112V1.Holding
+import Splice.Testing.Tokens.TestTokenV2
 
 template MintConsent with
     admin : Party
@@ -26,8 +27,17 @@ template MintConsent with
         assertMsg "invalid mint approver" (approver `elem` accountParties admin account && approver `notElem` approved)
         create this with approved = dedupSort (approver :: approved)
 
-    choice MintFixture : ContractId TokenHolding
+    choice MintFixture : ContractId Token
+      with args : ExtraArgs
       controller admin
       do
         assertMsg "incomplete mint consent" (approved == dedupSort (accountParties admin account))
-        exercise rules TokenRules_Mint with account; amount; instrumentId = instrument; reason = "PoC fixture funding"
+        now <- getTime
+        offer <- exercise rules TokenRules_OfferMint with
+          receiver = account; amount; instrumentId = H.InstrumentId admin instrument
+          offeredAt = now; receiverConfig = AccountConfig admin account (PartyConfig True True) (PartyConfig True True)
+        result <- exercise (toInterfaceContractId @T.TransferInstruction offer.offerCid) T.TransferInstruction_Accept with
+          actors = accountParties admin account; extraArgs = args
+        case result.output of
+          T.TransferInstructionResult_Completed cids -> pure (fromInterfaceContractId @Token (head cids))
+          _ -> abort "fixture mint did not complete"

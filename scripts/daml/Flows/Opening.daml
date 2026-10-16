@@ -2,52 +2,227 @@ module Flows.Opening where
 
 import Daml.Script
 import DA.Assert ((===))
+import DA.Foldable (forA_)
+import DA.List (dedupSort)
+import DA.TextMap qualified as TM
+import Splice.Api.Token.AllocationV2 qualified as A
+import Splice.Api.Token.AllocationInstructionV2 qualified as F
+import Splice.TokenStandard.Utils (toAnyContractId)
+import Splice.Testing.Tokens.TestTokenV2
+import Auction.Assets
+import Auction.Types
 import Auction.Workflow
 import Flows.Support
 
--- Follow the authority from av, through issuer and provider consent, into
--- registry funding. No joint submission is used to approve the preparation.
+-- The issuer submits once. Its provider approves two registry instructions,
+-- and the operator can open only after both allocations have completed.
 opening : Script ()
 opening = do
   e <- setup "opening" False
   let t = e.terms
-  p0 <- submit (actAs t.ao <> readAs t.av) do exerciseCmd (grant e Preparation) StartRound with terms = t
+  preparation <- submit (actAs t.ao <> readAs t.av) do
+    exerciseCmd (grant e Preparation) StartRound with terms = t
+  (holding, _) <- mint e False t.inventory 100.0
+  source@(RegistryPreparedRound request) <- submitRoundFunding e preparation [holding]
+  Some pending <- queryContractId t.av request
+  dedupSort (signatory pending) === dedupSort [t.issuer, t.av]
+  pending.roundId === toAnyContractId preparation
+  assertGone t.av preparation
+  F.AllocationInstructionResult_Pending inventory <- pure pending.inventory
+  F.AllocationInstructionResult_Pending proceeds <- pure pending.receipt
+  Some inventoryDisclosure <- queryDisclosure @TokenAllocationInstructionV2 t.tokenAdmin (fromInterfaceContractId inventory)
+  Some receiptDisclosure <- queryDisclosure @TokenAllocationInstructionV2 t.cashAdmin (fromInterfaceContractId proceeds)
+  query @Proposal t.av >>= (\xs -> length xs === 0)
+  query @SaleAuthority t.av >>= (\xs -> length xs === 0)
 
-  -- The operator cannot fund before the issuer and account provider consent.
-  submitMustFail (actAs t.ao <> readAs t.av) do exerciseCmd p0 FundRound with inputs = []
-  p1 <- submit t.issuer do exerciseCmd p0 ApproveRound with approver = t.issuer
-  submitMustFail (actAs t.ao <> readAs t.av) do exerciseCmd p1 FundRound with inputs = []
-  p2 <- submit e.issuerProvider do exerciseCmd p1 ApproveRound with approver = e.issuerProvider
+  -- Pending instructions are not completed allocations, even when disclosed.
+  submitMustFail (actAs t.ao <> readAs t.av <> discloseMany [inventoryDisclosure,receiptDisclosure]) do
+    exerciseCmd (grant e Opening) OpenRound with
+      source; supply = coerceContractId inventory; receipt = coerceContractId proceeds
+  balance t.issuer t.inventory t.tokenInstrument True >>= (=== 0.0)
+  balance t.issuer t.inventory t.tokenInstrument False >>= (=== 100.0)
 
-  (holding, disclosure) <- mint e False t.inventory 100.0
-  proposal <- submit (actAs t.ao <> readAs t.av <> discloseMany (disclosure :: e.disclosures)) do
-    exerciseCmd p2 FundRound with inputs = [holding]
-  Some p <- queryContractId t.av proposal
+  supply <- completeAllocation e False pending.inventory
+  -- Locked inventory alone is insufficient: proceeds approval is still pending.
+  submitMustFail (actAs t.ao <> readAs t.av <> discloseMany [receiptDisclosure]) do
+    exerciseCmd (grant e Opening) OpenRound with source; supply; receipt = coerceContractId proceeds
+  assertActive t.av request
   balance t.issuer t.inventory t.tokenInstrument True >>= (=== 100.0)
-  balance t.issuer t.inventory t.tokenInstrument False >>= (=== 0.0)
+  receipt <- completeAllocation e True pending.receipt
 
-  -- Opening uses issuer authority from Proposal and account authority from
-  -- SaleAuthority. The stable round identity is the consumed proposal's CID.
+  -- ao cannot invoke the av-controlled completion choice directly.
+  submitMustFail (actAs t.ao <> readAs t.av) do exerciseCmd request CompleteFunding with supply; receipt
   (round, published) <- submit (actAs t.ao <> readAs t.av) do
-    exerciseCmd (grant e Opening) OpenRound with proposal; supply = p.lock.root
+    exerciseCmd (grant e Opening) OpenRound with source; supply; receipt
   Some r <- queryContractId t.av round
   Some terms <- queryContractId t.av published
-  r.roundId === proposal
-  terms.roundId === proposal
+  Some sale <- queryContractId t.av r.sale
+  r.roundId === toAnyContractId preparation
+  terms.roundId === r.roundId
   r.accepted === []
   r.nextNumber === 0
-
-  -- Reusing the proposal cannot open a second round with the same supply.
+  dedupSort (signatory sale) === dedupSort [t.issuer,t.av]
+  assertGone t.av request
+  query @Proposal t.av >>= (\xs -> length xs === 0)
+  -- Completion, proposal creation and opening commit together, once.
   submitMustFail (actAs t.ao <> readAs t.av) do
-    exerciseCmd (grant e Opening) OpenRound with proposal; supply = p.lock.root
-  debug "Opening complete: separate consent, locked supply, one stable round."
+    exerciseCmd (grant e Opening) OpenRound with source; supply; receipt
+  debug "Opening complete: issuer request, registry custody approvals, one round."
 
--- Abandoning a funded proposal produces a recovery ticket before any round
--- exists. Recovery returns inventory to the issuer's original account.
+-- Basic issuer accounts produce both allocations and a proposal immediately.
+-- Clearing still returns unsold inventory and delivers the bidder's tokens.
+immediateRoundFunding : Script ()
+immediateRoundFunding = do
+  initial <- setup "immediate-round" False
+  let e = basicIssuerAccounts initial
+      t = e.terms
+      b = bidTerms e e.bob 5 12.0
+  preparation <- submit (actAs t.ao <> readAs t.av) do
+    exerciseCmd (grant e Preparation) StartRound with terms = t
+  (holding, _) <- mint e False t.inventory 130.0
+  source@(FundedRound proposal) <- submitRoundFunding e preparation [holding]
+  Some p <- queryContractId t.av proposal
+  p.roundId === toAnyContractId preparation
+  dedupSort (signatory p) === dedupSort [t.issuer,t.av]
+  Some inventory <- queryContractId t.av (fromInterfaceContractId @TokenAllocationV2 p.lock.root)
+  Some receipt <- queryContractId t.av (fromInterfaceContractId @TokenAllocationV2 p.receipt.root)
+  inventory.allocation.nextIterationFunding === Some (TM.fromList [(t.tokenInstrument,100.0)])
+  receipt.allocation.nextIterationFunding === Some TM.empty
+  receipt.lockedTokens === TM.empty
+  inventory.settlement === settlementFor t p.roundId
+  receipt.settlement === inventory.settlement
+  balance t.issuer t.inventory t.tokenInstrument True >>= (=== 100.0)
+  balance t.issuer t.inventory t.tokenInstrument False >>= (=== 30.0)
+  (round, published) <- submit (actAs t.ao <> readAs t.av) do
+    exerciseCmd (grant e Opening) OpenRound with source; supply = p.lock.root; receipt = p.receipt.root
+  bid <- prepareBid e published b
+  admitted <- acceptBatch e round p.lock.root [bid]
+  closed <- closeRound e admitted
+  input <- clearInput e closed p.lock.root [bid]
+  _ <- clearRound e closed input
+  balance t.issuer t.inventory t.tokenInstrument False >>= (=== 80.0)
+  balance t.issuer t.proceeds t.cashInstrument False >>= (=== 400.0)
+  balance e.bob b.delivery t.tokenInstrument False >>= (=== 50.0)
+  balance e.bob b.payment t.cashInstrument False >>= (=== 200.0)
+  forA_ [p.lock.root,p.receipt.root] $ \cid -> assertGone t.av (fromInterfaceContractId @TokenAllocationV2 cid)
+
+-- One registry may complete immediately while the other needs its provider.
+-- Both combinations keep the completed side and open after registry approval.
+mixedRoundFunding : Script ()
+mixedRoundFunding = forA_ [True,False] $ \custodiedInventory -> do
+  initial <- setup (if custodiedInventory then "pending-inventory" else "pending-proceeds") False
+  let t = if custodiedInventory
+          then (initial.terms with proceeds = initial.terms.proceeds with provider = None)
+          else (initial.terms with inventory = initial.terms.inventory with provider = None)
+      e = initial with terms = t
+  preparation <- submit (actAs t.ao <> readAs t.av) do
+    exerciseCmd (grant e Preparation) StartRound with terms = t
+  (holding, _) <- mint e False t.inventory 100.0
+  source@(RegistryPreparedRound request) <- submitRoundFunding e preparation [holding]
+  Some pending <- queryContractId t.av request
+  if custodiedInventory then do
+    F.AllocationInstructionResult_Pending _ <- pure pending.inventory
+    F.AllocationInstructionResult_Completed receipt <- pure pending.receipt
+    assertActive t.av (fromInterfaceContractId @TokenAllocationV2 receipt)
+  else do
+    F.AllocationInstructionResult_Completed supply <- pure pending.inventory
+    F.AllocationInstructionResult_Pending _ <- pure pending.receipt
+    assertActive t.av (fromInterfaceContractId @TokenAllocationV2 supply)
+  (supply,receipt) <- completeRoundFunding e source
+  if custodiedInventory then do
+    -- Even an otherwise identical receipt cannot replace the completed original.
+    now <- getTime
+    duplicate <- submit (actAs t.issuer <> discloseMany e.staticDisclosures) do
+      exerciseCmd (toInterfaceContractId @F.AllocationFactory t.cashRules) F.AllocationFactory_Allocate with
+        settlement = settlementFor t pending.roundId
+        allocation = mkSpec t.cashAdmin t.proceeds t.settlementDeadline TM.empty
+        requestedAt = now; inputHoldingCids = []; actors = [t.issuer]; extraArgs = cashContext e
+    F.AllocationInstructionResult_Completed otherReceipt <- pure duplicate.output
+    submitMustFail (actAs t.ao <> readAs t.av) do
+      exerciseCmd (grant e Opening) OpenRound with source; supply; receipt = otherReceipt
+    assertActive t.av request
+  else pure ()
+  _ <- submit (actAs t.ao <> readAs t.av) do
+    exerciseCmd (grant e Opening) OpenRound with source; supply; receipt
+  assertGone t.av request
+  balance t.issuer t.inventory t.tokenInstrument True >>= (=== 100.0)
+
+-- Allocations for another preparation cannot fund this round. Opening must also
+-- complete before the bidding cutoff, even if registry approvals finished earlier.
+roundFundingBindings : Script ()
+roundFundingBindings = do
+  e <- setup "round-funding-bindings" False
+  let t = e.terms
+  (source@(RegistryPreparedRound request),supply,receipt) <- prepareRound e
+  (foreign@(RegistryPreparedRound otherRequest),otherSupply,otherReceipt) <- prepareRound e
+  submitMustFail (actAs t.ao <> readAs t.av) do
+    exerciseCmd (grant e Opening) OpenRound with source; supply; receipt = otherReceipt
+  submitMustFail (actAs t.ao <> readAs t.av) do
+    exerciseCmd (grant e Opening) OpenRound with source; supply = otherSupply; receipt
+  submitMustFail (actAs t.ao <> readAs t.av) do
+    exerciseCmd (grant e Admission) OpenRound with source; supply; receipt
+  assertActive t.av request
+  assertActive t.av otherRequest
+  _ <- submit (actAs t.ao <> readAs t.av) do
+    exerciseCmd (grant e Opening) OpenRound with source; supply; receipt
+  setTime t.biddingDeadline
+  submitMustFail (actAs t.ao <> readAs t.av) do
+    exerciseCmd (grant e Opening) OpenRound with source = foreign; supply = otherSupply; receipt = otherReceipt
+  assertActive t.av otherRequest
+
+-- Revocation stops new funding requests. Existing instructions can complete
+-- and open through the independently governed opening grant.
+roundFundingPause : Script ()
+roundFundingPause = do
+  e <- setup "round-funding-pause" False
+  let t = e.terms
+  ready <- submit (actAs t.ao <> readAs t.av) do
+    exerciseCmd (grant e Preparation) StartRound with terms = t
+  unfunded <- submit (actAs t.ao <> readAs t.av) do
+    exerciseCmd (grant e Preparation) StartRound with terms = t
+  (holding, _) <- mint e False t.inventory 100.0
+  source <- submitRoundFunding e ready [holding]
+  (unused, unusedDisclosure) <- mint e False t.inventory 100.0
+  Some grantDisclosure <- queryDisclosure @Grant t.av (grant e Preparation)
+  submit t.av do archiveCmd (grant e Preparation)
+  submitMustFail (actAs t.issuer <> discloseMany ([grantDisclosure,unusedDisclosure] <> e.staticDisclosures)) do
+    exerciseCmd unfunded FundRound with preparation = grant e Preparation; inputs = [unused]; cashArgs = cashContext e; tokenArgs = tokenContext e
+  assertActive t.av unfunded
+  (supply,receipt) <- completeRoundFunding e source
+  _ <- submit (actAs t.ao <> readAs t.av) do
+    exerciseCmd (grant e Opening) OpenRound with source; supply; receipt
+  pure ()
+
+-- A fully funded immediate proposal can be abandoned before opening.
+-- Its recovery ticket releases both bound issuer allocations.
 abandonProposal : Script ()
 abandonProposal = do
-  e <- setup "abandon-proposal" False
-  (proposal, supply) <- prepareRound e
+  initial <- setup "abandon-proposal" False
+  let e = basicIssuerAccounts initial
+  (FundedRound proposal, supply, receipt) <- prepareRound e
   ticket <- submit e.terms.issuer do exerciseCmd proposal AbandonProposal
-  _ <- submit (actAs e.terms.ao <> readAs e.terms.av) do exerciseCmd (grant e Recovery) Release with ticket; current = supply
+  _ <- releaseTicket e ticket supply receipt
   balance e.terms.issuer e.terms.inventory e.terms.tokenInstrument False >>= (=== 100.0)
+
+-- Custody updates may change either allocation ID before opening. The source
+-- remains usable with active allocations carrying its full settlement reference.
+activeRoundAllocations : Script ()
+activeRoundAllocations = do
+  e <- setup "active-round-allocations" False
+  let t = e.terms
+  (source@(RegistryPreparedRound request),supply,receipt) <- prepareRound e
+  successors <- forA [(supply,tokenContext e),(receipt,cashContext e)] $ \(cid,args) -> do
+    result <- submit (actAs t.issuer <> discloseMany e.disclosures) do
+      exerciseCmd cid A.Allocation_Withdraw with actors = [t.issuer]; extraArgs = args
+    A.AllocationResult_Pending current <- pure result.output
+    pure current
+  let [currentSupply,currentReceipt] = successors
+  submitMustFail (actAs t.ao <> readAs t.av) do
+    exerciseCmd (grant e Opening) OpenRound with source; supply; receipt
+  assertActive t.av request
+  (round, _) <- submit (actAs t.ao <> readAs t.av) do
+    exerciseCmd (grant e Opening) OpenRound with source; supply = currentSupply; receipt = currentReceipt
+  closed <- closeRound e round
+  input <- clearInput e closed currentSupply []
+  _ <- clearRound e closed (input with proceeds = currentReceipt)
+  balance t.issuer t.inventory t.tokenInstrument False >>= (=== 100.0)

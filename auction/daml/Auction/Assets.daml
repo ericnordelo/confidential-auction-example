@@ -1,21 +1,20 @@
 module Auction.Assets where
 
-import DA.Optional (fromOptional)
-
+import DA.Optional (fromOptional, isNone, isSome)
 import DA.Foldable (forA_)
-import DA.Action (unless)
-import DA.List (dedupSort, head)
 import DA.TextMap qualified as TM
 import Splice.Api.Token.HoldingV2 qualified as H
 import Splice.Api.Token.AllocationV2 qualified as A
 import Splice.Api.Token.AllocationInstructionV2 qualified as F
 import Splice.Api.Token.MetadataV1
 import Splice.TokenStandard.Utils
-import OpenZeppelin.TokenCIP112V1.Allocation (TokenAllocation(..))
-import OpenZeppelin.TokenCIP112V1.Registry (TokenRules(..))
+import Splice.Testing.Tokens.TestTokenV2.Allocation (TokenAllocationV2(..))
+import Splice.Testing.Tokens.TestTokenV2 (TokenRules(..), AccountConfig, accountConfigsContextKey)
+import Splice.Testing.Tokens.TestTokenV2.Util (tokenRulesContextKey)
 
 type AllocationId = ContractId A.Allocation
 
+-- Both funded send authorization and unfunded receipt authorization use this binding.
 data LockBinding = LockBinding with
     root : AllocationId
     settlement : A.SettlementInfo
@@ -25,71 +24,72 @@ data LockBinding = LockBinding with
 extra : ExtraArgs
 extra = ExtraArgs emptyChoiceContext emptyMetadata
 
-mkSpec : Party -> H.Account -> Time -> [A.TransferLegSide] -> A.AllocationSpecification
-mkSpec admin account deadline sides = A.AllocationSpecification admin account sides (Some deadline) None True emptyMetadata
+-- Splice context supplies its event log and the account-provider policy.
+registryArgs : ContractId TokenRules -> [ContractId AccountConfig] -> ExtraArgs
+registryArgs rules configs = ExtraArgs (ChoiceContext (TM.fromList
+  [(tokenRulesContextKey, AV_ContractId (toAnyContractId rules)),
+   (accountConfigsContextKey, AV_List [AV_ContractId (toAnyContractId cid) | cid <- configs])])) emptyMetadata
 
-allocate : ContractId TokenRules -> A.SettlementInfo -> A.AllocationSpecification -> [ContractId H.Holding] -> Update AllocationId
-allocate rules settlement spec inputs = do
-  -- PublicFetch is necessary here: disclosure lets the operator resolve the
-  -- factory, but does not grant the admin authority needed by a plain fetch.
+-- Some funding enables exact legs to be supplied later. Some emptyMap enables
+-- receipt without reserving assets. None at creation would disable that feature.
+mkSpec : Party -> H.Account -> Time -> TM.TextMap Decimal -> A.AllocationSpecification
+mkSpec admin account deadline funding =
+  A.AllocationSpecification admin account [] (Some deadline) (Some funding) True emptyMetadata
+
+-- The registry decides whether the supplied actors can complete immediately.
+requestAllocation : ContractId TokenRules -> A.SettlementInfo -> A.AllocationSpecification -> [ContractId H.Holding] -> [Party] -> ExtraArgs -> Update F.AllocationInstructionResult
+requestAllocation rules settlement spec inputs actors args = do
   r <- exercise (toInterfaceContractId @F.AllocationFactory rules) F.AllocationFactory_PublicFetch with
-    actors = accountParties spec.admin spec.authorizer
+    actors
   assertMsg "wrong registry admin" (r.admin == spec.admin)
   now <- getTime
-  result <- exercise (toInterfaceContractId @F.AllocationFactory rules) F.AllocationFactory_Allocate with
-    settlement
-    allocation = spec
-    requestedAt = now
-    inputHoldingCids = inputs
-    actors = accountParties spec.admin spec.authorizer
-    extraArgs = extra
-  case result.output of
-    F.AllocationInstructionResult_Completed cid -> pure cid
-    _ -> abort "auction requires synchronous allocation completion"
+  exercise (toInterfaceContractId @F.AllocationFactory rules) F.AllocationFactory_Allocate with
+    settlement; allocation = spec; requestedAt = now; inputHoldingCids = inputs
+    actors; extraArgs = args
 
--- This sender-only self-return leg reserves funds without authorizing a sale.
--- The clear must cancel it and obtain new, exact sender AND receiver approvals.
-createLock : ContractId TokenRules -> Party -> H.Account -> Text -> Decimal -> Party -> Time -> AnyContractId -> [ContractId H.Holding] -> Update LockBinding
-createLock rules admin account instrument amount av deadline preparation inputs = do
-  let settlement = A.SettlementInfo [av] "auction-preparation" (Some preparation) emptyMetadata
-      leg = A.TransferLeg "reserve" account account amount instrument emptyMetadata
-      spec = mkSpec admin account deadline [senderSide leg]
-  root <- allocate rules settlement spec inputs
-  pure (LockBinding root settlement spec)
+-- Bind a completed registry allocation after a wallet/custodian workflow.
+-- Pending instructions cannot be fetched as the approved allocation template.
+bindAllocation : A.SettlementInfo -> A.AllocationSpecification -> AllocationId -> Update LockBinding
+bindAllocation settlement specification current = do
+  a <- fetch (fromInterfaceContractId @TokenAllocationV2 current)
+  let binding = LockBinding (fromOptional current a.originalAllocationCid) settlement specification
+  _ <- checkLock binding current
+  pure binding
 
--- A successor is accepted only from this registry template and the same root.
--- Registry code and its upgrade governance remain part of the trust boundary.
-checkLock : LockBinding -> AllocationId -> Update TokenAllocation
+-- Bind the pinned upstream template, exact specification and allocation root.
+-- No settlement iteration may precede the auction clear.
+checkLock : LockBinding -> AllocationId -> Update TokenAllocationV2
 checkLock expected current = do
-  a <- fetch (fromInterfaceContractId @TokenAllocation current)
+  a <- fetch (fromInterfaceContractId @TokenAllocationV2 current)
   assertMsg "wrong allocation lineage" (fromOptional current a.originalAllocationCid == expected.root)
   assertMsg "changed allocation settlement" (a.settlement == expected.settlement)
   assertMsg "changed allocation specification" (a.allocation == expected.specification)
-  let sides = expected.specification.transferLegSides
-  assertMsg "lock must have one sender side" (length sides == 1 && (head sides).side == A.SenderSide)
-  holdings <- mapA fetch a.lockedHoldingCids
-  forA_ holdings $ \h -> do
-    assertMsg "wrong funded account" (h.holding.account == expected.specification.authorizer)
-    assertMsg "wrong funded instrument" (h.holding.instrumentId == H.InstrumentId expected.specification.admin (head sides).instrumentId)
-    case h.holding.lock of
-      None -> abort "allocation funding is not locked"
-      Some l -> do
-        assertMsg "wrong lock holders" (dedupSort l.holders == dedupSort (expected.specification.admin :: expected.settlement.executors))
-        assertMsg "funding lock expires too early" (l.expiresAt == Some a.lockExpiresAt && a.lockExpiresAt > a.expiresAt)
-  assertMsg "wrong funded amount" (sum (map (\h -> h.holding.amount) holdings) == (head sides).amount)
+  assertMsg "allocation already iterated" (a.numIterations == 0)
+  assertMsg "allocation must be committed and iterated" (a.allocation.committed && isSome a.allocation.nextIterationFunding && null a.allocation.transferLegSides)
+  -- Splice holdings are private to their account parties. The approved registry
+  -- implementation establishes funding; the round validates its signed allocation.
+  let funding = fromOptional TM.empty expected.specification.nextIterationFunding
+  assertMsg "funding keys mismatch" (map fst (TM.toList a.lockedTokens) == map fst (TM.toList funding))
+  assertMsg "missing funding holdings" (not (any (null . snd) (TM.toList a.lockedTokens)))
   pure a
 
-cancel : Party -> AllocationId -> Update [ContractId H.Holding]
-cancel av cid = do
-  result <- exercise cid A.Allocation_Cancel with actors = [av]; extraArgs = extra
+cancel : Party -> AllocationId -> ExtraArgs -> Update [ContractId H.Holding]
+cancel av cid args = do
+  result <- exercise cid A.Allocation_Cancel with actors = [av]; extraArgs = args
+  assertMsg "cancellation is still pending" (result.output == A.AllocationResult_Cancelled)
   pure (concatMap snd (TM.toList result.authorizerHoldingCids))
 
-settle : ContractId TokenRules -> Party -> A.SettlementInfo -> [A.TransferLeg] -> [AllocationId] -> ExtraArgs -> Update ()
-settle rules av settlement legs allocations args = unless (null legs) do
-  _ <- exercise (toInterfaceContractId @A.SettlementFactory rules) A.SettlementFactory_SettleBatch with
-    settlement
-    transferLegs = legs
-    allocations = map nonIteratedAllocation allocations
-    actors = [av]
-    extraArgs = args
-  pure ()
+-- None here ends the allocation after this settlement and refunds unused funds.
+finalize : AllocationId -> [A.TransferLegSide] -> A.FinalizedAllocation
+finalize cid sides = A.FinalizedAllocation cid sides None
+
+settle : ContractId TokenRules -> Party -> A.SettlementInfo -> [A.TransferLeg] -> [A.FinalizedAllocation] -> ExtraArgs -> Update ()
+settle rules av settlement legs allocations args =
+  if null legs then assertMsg "allocations supplied without movements" (null allocations)
+  else do
+    assertMsg "auction allocations must end after clear" (all (isNone . (.nextIterationFunding)) allocations)
+    result <- exercise (toInterfaceContractId @A.SettlementFactory rules) A.SettlementFactory_SettleBatch with
+      settlement; transferLegs = legs; allocations; actors = [av]; extraArgs = args
+    assertMsg "missing settlement result" (length result.allocationSettleResults == length allocations)
+    forA_ result.allocationSettleResults $ \r ->
+      assertMsg "settlement incomplete or funding retained" (r.output == A.AllocationResult_Settled None)

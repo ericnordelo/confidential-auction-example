@@ -1,11 +1,13 @@
 module Auction.Workflow where
 
-import DA.Optional (fromOptional)
+import DA.Optional (isNone, isSome)
 
 import DA.Foldable (forA_)
 import DA.List (dedupSort)
+import DA.TextMap qualified as TM
 import Splice.Api.Token.HoldingV2 qualified as H
 import Splice.Api.Token.AllocationV2 qualified as A
+import Splice.Api.Token.AllocationInstructionV2 qualified as F
 import Splice.Api.Token.MetadataV1
 import Splice.TokenStandard.Utils (toAnyContractId, senderSide, receiverSide)
 import Auction.Types
@@ -34,33 +36,30 @@ template Grant with
       do
         checkGrant this Preparation terms
         assertMsg "invalid round terms" (validTerms terms)
-        create $ RoundPreparation terms None []
-
-    nonconsuming choice StartBid : ContractId BidPreparation
-      with published : ContractId PublishedTerms; bid : BidTerms
-      controller ao
-      do
-        p <- fetch published
-        checkGrant this Preparation p.terms
-        assertMsg "invalid bid" (validBid p.terms bid)
-        before p.terms.biddingDeadline
-        create $ BidPreparation p.terms p.roundId bid None []
+        create $ RoundPreparation terms
 
     nonconsuming choice OpenRound : (ContractId Round, ContractId PublishedTerms)
-      with proposal : ContractId Proposal; supply : AllocationId
+      with source : RoundSource; supply : AllocationId; receipt : AllocationId
       controller ao
       do
-        p <- fetch proposal
-        checkGrant this Opening p.terms
-        exercise proposal Proposal_Open with supply
+        proposal <- case source of
+          FundedRound cid -> do
+            p <- fetch cid
+            checkGrant this Opening p.terms
+            pure cid
+          RegistryPreparedRound cid -> do
+            request <- fetch cid
+            checkGrant this Opening request.terms
+            exercise cid CompleteFunding with supply; receipt
+        exercise proposal Proposal_Open with supply; receipt
 
     nonconsuming choice AcceptBatch : ContractId Round
-      with round : ContractId Round; bids : [AdmissionInput]; supply : AllocationId
+      with round : ContractId Round; bids : [AdmissionInput]; supply : AllocationId; receipt : AllocationId
       controller ao
       do
         r <- fetch round
         checkGrant this Admission r.terms
-        exercise round Round_AcceptBatch with bids; supply
+        exercise round Round_AcceptBatch with bids; supply; receipt
 
     nonconsuming choice CloseRound : ContractId Round
       with round : ContractId Round
@@ -87,12 +86,12 @@ template Grant with
         exercise round Round_End with expired; reason
 
     nonconsuming choice Release : [ContractId H.Holding]
-      with ticket : ContractId RecoveryTicket; current : AllocationId
+      with ticket : ContractId RecoveryTicket; current : AllocationId; receipt : AllocationId; fundingArgs : ExtraArgs; receiptArgs : ExtraArgs
       controller ao
       do
         t <- fetch ticket
         assertMsg "wrong recovery grant" (kind == Recovery && t.av == av && t.ao == ao)
-        exercise ticket Recover with current
+        exercise ticket Recover with current; receipt; fundingArgs; receiptArgs
 
     nonconsuming choice CloseUnsettledBid : ContractId Outcome
       with ended : ContractId EndedRound; bid : ContractId AcceptedBid
@@ -118,58 +117,109 @@ before deadline = do
   now <- getTime
   assertMsg "deadline reached" (now < deadline)
 
--- Each approval consumes the current state. Its signatories accumulate the
--- exact account parties whose consent the later funding choice will need.
+-- The issuer approves the terms and requests funding in one submission.
+-- Account providers approve only the registry's allocation instructions.
 template RoundPreparation with
     terms : Terms
-    identity : Optional AnyContractId
-    approved : [Party]
   where
-    signatory terms.av, approved
+    signatory terms.av
     observer terms.ao, issuerParties terms
-    ensure validTerms terms && all (`elem` issuerParties terms) approved && approved == dedupSort approved
+    ensure validTerms terms
 
-    choice ApproveRound : ContractId RoundPreparation
-      with approver : Party
-      controller approver
+    choice FundRound : RoundSource
+      with preparation : ContractId Grant; inputs : [ContractId H.Holding]; cashArgs : ExtraArgs; tokenArgs : ExtraArgs
+      controller terms.issuer
       do
-        assertMsg "not an outstanding approver" (approver `elem` issuerParties terms && approver `notElem` approved)
-        create this with identity = Some (fromOptional (toAnyContractId self) identity); approved = dedupSort (approver :: approved)
-
-    choice FundRound : ContractId Proposal
-      with inputs : [ContractId H.Holding]
-      controller terms.ao
-      do
-        assertMsg "missing issuer account consent" (approved == issuerParties terms)
+        g <- fetch preparation
+        checkGrant g Preparation terms
         before terms.biddingDeadline
-        lock <- createLock terms.tokenRules terms.tokenAdmin terms.inventory terms.tokenInstrument
-          (intToDecimal terms.supplyLots * terms.lotSize) terms.av terms.settlementDeadline
-          (fromOptional (toAnyContractId self) identity) inputs
-        sale <- create $ SaleAuthority terms None lock
-        create $ Proposal terms sale lock
+        -- A single identity is known before either asset is allocated.
+        let roundId = toAnyContractId self
+            settlement = settlementFor terms roundId
+            inventorySpec = mkSpec terms.tokenAdmin terms.inventory terms.settlementDeadline
+              (TM.fromList [(terms.tokenInstrument, intToDecimal terms.supplyLots * terms.lotSize)])
+            receiptSpec = mkSpec terms.cashAdmin terms.proceeds terms.settlementDeadline TM.empty
+        inventory <- requestAllocation terms.tokenRules settlement inventorySpec inputs [terms.issuer] tokenArgs
+        receipt <- requestAllocation terms.cashRules settlement receiptSpec [] [terms.issuer] cashArgs
+        assertMsg "allocation request failed" (inventory.output /= F.AllocationInstructionResult_Failed && receipt.output /= F.AllocationInstructionResult_Failed)
+        case (inventory.output, receipt.output) of
+          (F.AllocationInstructionResult_Completed supply, F.AllocationInstructionResult_Completed proceeds) ->
+            FundedRound <$> createRoundProposal terms roundId
+              (LockBinding supply settlement inventorySpec) (LockBinding proceeds settlement receiptSpec)
+          _ -> RegistryPreparedRound <$> create (RoundFundingRequest terms roundId inventory.output receipt.output)
 
     choice AbandonRoundPreparation : ()
       controller terms.issuer
       do pure ()
 
+data RoundSource
+  = FundedRound (ContractId Proposal)
+  | RegistryPreparedRound (ContractId RoundFundingRequest)
+  deriving (Eq, Show)
+
+template RoundFundingRequest with
+    terms : Terms
+    roundId : AnyContractId
+    inventory : F.AllocationInstructionResult_Output
+    receipt : F.AllocationInstructionResult_Output
+  where
+    signatory terms.issuer, terms.av
+    observer terms.ao, issuerParties terms
+    ensure validTerms terms && inventory /= F.AllocationInstructionResult_Failed && receipt /= F.AllocationInstructionResult_Failed
+
+    -- Abandonment ends the auction request. Registry withdrawal releases its assets.
+    choice AbandonRoundFunding : ()
+      controller terms.issuer
+      do pure ()
+
+    -- The opening grant binds completed allocations and opens in one transaction.
+    choice CompleteFunding : ContractId Proposal
+      with supply : AllocationId; receipt : AllocationId
+      controller terms.av
+      do
+        before terms.biddingDeadline
+        let settlement = settlementFor terms roundId
+        lock <- bindAllocation settlement
+          (mkSpec terms.tokenAdmin terms.inventory terms.settlementDeadline
+            (TM.fromList [(terms.tokenInstrument, intToDecimal terms.supplyLots * terms.lotSize)])) supply
+        receiving <- bindAllocation settlement
+          (mkSpec terms.cashAdmin terms.proceeds terms.settlementDeadline TM.empty) receipt
+        -- Preserve any side that already completed in the issuer's submission.
+        checkCompletedRoot inventory lock
+        checkCompletedRoot this.receipt receiving
+        createRoundProposal terms roundId lock receiving
+
+checkCompletedRoot : F.AllocationInstructionResult_Output -> LockBinding -> Update ()
+checkCompletedRoot output binding = case output of
+  F.AllocationInstructionResult_Completed cid -> assertMsg "changed completed allocation" (binding.root == cid)
+  F.AllocationInstructionResult_Pending _ -> pure ()
+  F.AllocationInstructionResult_Failed -> abort "allocation request failed"
+
+createRoundProposal : Terms -> AnyContractId -> LockBinding -> LockBinding -> Update (ContractId Proposal)
+createRoundProposal terms roundId lock receipt = do
+  sale <- create $ SaleAuthority terms None lock receipt
+  create $ Proposal terms roundId sale lock receipt
+
 template Proposal with
     terms : Terms
+    roundId : AnyContractId
     sale : ContractId SaleAuthority
     lock : LockBinding
+    receipt : LockBinding
   where
     signatory terms.issuer, terms.av
     observer terms.ao
 
     choice Proposal_Open : (ContractId Round, ContractId PublishedTerms)
-      with supply : AllocationId
+      with supply : AllocationId; receipt : AllocationId
       controller terms.av
       do
         before terms.biddingDeadline
         a <- checkLock lock supply
-        assertMsg "supply is marked" (a.d2SeizureHook == None)
-        bound <- exercise sale BindSale with roundId = self
-        round <- create $ Round terms self bound lock Open [] 0
-        published <- create $ PublishedTerms terms self
+        receiving <- checkLock this.receipt receipt
+        bound <- exercise sale BindSale with roundId
+        round <- create $ Round terms roundId bound lock this.receipt Open [] 0
+        published <- create $ PublishedTerms terms roundId
         pure (round, published)
 
     choice AbandonProposal : ContractId RecoveryTicket
@@ -178,77 +228,128 @@ template Proposal with
 
 template PublishedTerms with
     terms : Terms
-    roundId : ContractId Proposal
+    roundId : AnyContractId
   where
     signatory terms.issuer, terms.av
     observer terms.ao
 
-template BidPreparation with
-    terms : Terms
-    roundId : ContractId Proposal
-    bid : BidTerms
-    identity : Optional AnyContractId
-    approved : [Party]
-  where
-    signatory terms.av, approved
-    observer terms.issuer, terms.ao, bidParties terms bid
-    ensure validBid terms bid && all (`elem` bidParties terms bid) approved && approved == dedupSort approved
-
-    choice ApproveBid : ContractId BidPreparation
-      with approver : Party
-      controller approver
+    -- The bidder signs its terms and requests both allocations in one transaction.
+    -- Custodian authority is collected by the registry's own instructions.
+    nonconsuming choice SubmitBid : BidSource
+      with preparation : ContractId Grant; bid : BidTerms; inputs : [ContractId H.Holding]; cashArgs : ExtraArgs; tokenArgs : ExtraArgs
+      controller bid.bidder
       do
-        assertMsg "not an outstanding approver" (approver `elem` bidParties terms bid && approver `notElem` approved)
-        create this with identity = Some (fromOptional (toAnyContractId self) identity); approved = dedupSort (approver :: approved)
-
-    choice FundBid : ContractId PreparedBid
-      with inputs : [ContractId H.Holding]
-      controller terms.ao
-      do
-        assertMsg "missing bidder account consent" (approved == bidParties terms bid)
+        g <- fetch preparation
+        checkGrant g Preparation terms
+        assertMsg "invalid bid" (validBid terms bid)
         before terms.biddingDeadline
-        lock <- createLock terms.cashRules terms.cashAdmin bid.payment terms.cashInstrument
-          (paymentFor terms bid.lots bid.maxPrice) terms.av terms.settlementDeadline
-          (fromOptional (toAnyContractId self) identity) inputs
-        create $ PreparedBid terms roundId bid lock
+        let settlement = settlementFor terms roundId
+            paymentSpec = mkSpec terms.cashAdmin bid.payment terms.settlementDeadline
+              (TM.fromList [(terms.cashInstrument, paymentFor terms bid.lots bid.maxPrice)])
+            receiptSpec = mkSpec terms.tokenAdmin bid.delivery terms.settlementDeadline TM.empty
+        payment <- requestAllocation terms.cashRules settlement paymentSpec inputs [bid.bidder] cashArgs
+        receipt <- requestAllocation terms.tokenRules settlement receiptSpec [] [bid.bidder] tokenArgs
+        assertMsg "allocation request failed" (payment.output /= F.AllocationInstructionResult_Failed && receipt.output /= F.AllocationInstructionResult_Failed)
+        case (payment.output, receipt.output) of
+          (F.AllocationInstructionResult_Completed cash, F.AllocationInstructionResult_Completed token) -> do
+            let lock = LockBinding cash settlement paymentSpec
+                receiving = LockBinding token settlement receiptSpec
+            FundedBid <$> create (PreparedBid terms roundId bid lock receiving)
+          _ -> RegistryPreparedBid <$> create (BidRequest terms roundId bid payment.output receipt.output)
 
-    choice AbandonBidPreparation : ()
+template BidRequest with
+    terms : Terms
+    roundId : AnyContractId
+    bid : BidTerms
+    payment : F.AllocationInstructionResult_Output
+    receipt : F.AllocationInstructionResult_Output
+  where
+    signatory terms.av, bid.bidder
+    observer terms.issuer, terms.ao, bidParties terms bid
+    ensure validBid terms bid && payment /= F.AllocationInstructionResult_Failed && receipt /= F.AllocationInstructionResult_Failed
+
+    choice AbandonBidRequest : ()
       controller bid.bidder
       do pure ()
 
+    -- External registry workflows are bound only inside batch acceptance.
+    -- Before admission the application creates no cancellation ticket for them.
+    choice AcceptRegistryPrepared : ContractId AcceptedBid
+      with payment : AllocationId; receipt : AllocationId; number : Int; credentialRoot : ContractId Credential
+      controller terms.issuer, terms.av
+      do
+        before terms.biddingDeadline
+        (lock, receiving) <- bindBidAllocations terms roundId bid payment receipt
+        create $ AcceptedBid terms roundId bid lock receiving number credentialRoot
+
+bindBidAllocations : Terms -> AnyContractId -> BidTerms -> AllocationId -> AllocationId -> Update (LockBinding, LockBinding)
+bindBidAllocations terms roundId bid payment receipt = do
+  let settlement = settlementFor terms roundId
+  lock <- bindAllocation settlement
+    (mkSpec terms.cashAdmin bid.payment terms.settlementDeadline
+      (TM.fromList [(terms.cashInstrument, paymentFor terms bid.lots bid.maxPrice)])) payment
+  receiving <- bindAllocation settlement
+    (mkSpec terms.tokenAdmin bid.delivery terms.settlementDeadline TM.empty) receipt
+  pure (lock, receiving)
+
+
 template PreparedBid with
     terms : Terms
-    roundId : ContractId Proposal
+    roundId : AnyContractId
     bid : BidTerms
     lock : LockBinding
+    receipt : LockBinding
   where
-    signatory terms.av, bidParties terms bid
-    observer terms.issuer, terms.ao
+    signatory terms.av, bid.bidder
+    observer terms.issuer, terms.ao, bidParties terms bid
 
     choice Prepared_Accept : ContractId AcceptedBid
       with number : Int; credentialRoot : ContractId Credential
       controller terms.issuer, terms.av
-      do create $ AcceptedBid terms roundId bid lock number credentialRoot
+      do create $ AcceptedBid terms roundId bid lock receipt number credentialRoot
 
     choice WithdrawPreparedBid : ContractId RecoveryTicket
       controller bid.bidder
-      do ticketFor terms (bidParties terms bid) lock "unaccepted bid abandoned"
+      do ticketFor terms (bidParties terms bid) lock receipt "unaccepted bid abandoned"
+
+data BidSource
+  = FundedBid (ContractId PreparedBid)
+  | RegistryPreparedBid (ContractId BidRequest)
+  deriving (Eq, Show)
 
 data AdmissionInput = AdmissionInput with
-    prepared : ContractId PreparedBid
+    prepared : BidSource
     currentLock : AllocationId
+    currentReceipt : AllocationId
     credential : ContractId Credential
   deriving (Eq, Show)
+
+sourceIdentity : BidSource -> AnyContractId
+sourceIdentity source = case source of
+  FundedBid cid -> toAnyContractId cid
+  RegistryPreparedBid cid -> toAnyContractId cid
+
+-- Read authenticated terms and both completed allocation bindings. This
+-- constructs a value for validation, not a new on-ledger PreparedBid.
+admissionDetails : AdmissionInput -> Update PreparedBid
+admissionDetails input = case input.prepared of
+  FundedBid cid -> fetch cid
+  RegistryPreparedBid cid -> do
+    p <- fetch cid
+    (lock, receipt) <- bindBidAllocations p.terms p.roundId p.bid input.currentLock input.currentReceipt
+    pure (PreparedBid p.terms p.roundId p.bid lock receipt)
 
 data ClearEvidence = ClearEvidence with
     accepted : ContractId AcceptedBid
     currentLock : AllocationId
+    currentReceipt : AllocationId
     credential : ContractId Credential
   deriving (Eq, Show)
 
 data ClearInput = ClearInput with
     bids : [ClearEvidence]
     supply : AllocationId
+    proceeds : AllocationId
     proposed : Result
     approval : Optional (ContractId BatchApproval)
     cashArgs : ExtraArgs
@@ -257,9 +358,10 @@ data ClearInput = ClearInput with
 
 template Round with
     terms : Terms
-    roundId : ContractId Proposal
+    roundId : AnyContractId
     sale : ContractId SaleAuthority
     supplyLock : LockBinding
+    proceedsReceipt : LockBinding
     phase : Phase
     accepted : [ContractId AcceptedBid]
     nextNumber : Int
@@ -269,23 +371,30 @@ template Round with
     ensure nextNumber == length accepted && nextNumber <= terms.maxBids && length (dedupSort accepted) == length accepted
 
     choice Round_AcceptBatch : ContractId Round
-      with bids : [AdmissionInput]; supply : AllocationId
+      with bids : [AdmissionInput]; supply : AllocationId; receipt : AllocationId
       controller terms.av
       do
         assertMsg "round is closed" (phase == Open)
         before terms.biddingDeadline
         assertMsg "invalid batch size" (not (null bids) && length bids <= terms.maxBatch && nextNumber + length bids <= terms.maxBids)
-        assertMsg "duplicate prepared bid" (length (dedupSort (map (.prepared) bids)) == length bids)
+        assertMsg "duplicate prepared bid" (length (dedupSort (map (sourceIdentity . (.prepared)) bids)) == length bids)
+        existing <- mapA fetch accepted
+        incoming <- mapA admissionDetails bids
+        let roots = concatMap (\b -> [b.lock.root, b.receipt.root]) existing
+              <> concatMap (\b -> [b.lock.root, b.receipt.root]) incoming
+        assertMsg "allocation reused by multiple bids" (length (dedupSort roots) == length roots)
         a <- checkLock supplyLock supply
-        assertMsg "supply is marked" (a.d2SeizureHook == None)
-        new <- forA (zip [nextNumber..nextNumber + length bids - 1] bids) $ \(number, input) -> do
-          p <- fetch input.prepared
+        receiving <- checkLock proceedsReceipt receipt
+        new <- forA (zip [nextNumber..nextNumber + length bids - 1] (zip bids incoming)) $ \(number, (input, p)) -> do
           assertMsg "wrong bid round or terms" (p.roundId == roundId && p.terms == terms && validBid terms p.bid)
           allocation <- checkLock p.lock input.currentLock
-          assertMsg "payment lock is marked" (allocation.d2SeizureHook == None)
+          receiving <- checkLock p.receipt input.currentReceipt
           (root, exclusion) <- checkCredential terms.eligibilityProvider p.bid.bidder terms.av None input.credential
-          assertMsg "bidder not eligible" (exclusion == None)
-          exercise input.prepared Prepared_Accept with number; credentialRoot = root
+          assertMsg "bidder not eligible" (isNone exclusion)
+          case input.prepared of
+            FundedBid cid -> exercise cid Prepared_Accept with number; credentialRoot = root
+            RegistryPreparedBid cid -> exercise cid AcceptRegistryPrepared with
+              payment = input.currentLock; receipt = input.currentReceipt; number; credentialRoot = root
         create this with accepted = accepted <> new; nextNumber = nextNumber + length new
 
     choice Round_Close : ContractId Round
@@ -303,26 +412,27 @@ template Round with
         before terms.settlementDeadline
         assertMsg "accepted list changed" (map (.accepted) input.bids == accepted)
         supply <- checkLock supplyLock input.supply
-        assertMsg "supply is marked" (supply.d2SeizureHook == None)
+        receiving <- checkLock proceedsReceipt input.proceeds
         verified <- forA (zip [0..length input.bids - 1] input.bids) $ \(number, e) -> do
           b <- fetch e.accepted
           assertMsg "accepted record mismatch" (b.terms == terms && b.roundId == roundId && b.number == number)
           allocation <- checkLock b.lock e.currentLock
+          receiving <- checkLock b.receipt e.currentReceipt
           (_, excluded) <- checkCredential terms.eligibilityProvider b.bid.bidder terms.av (Some b.credentialRoot) e.credential
-          let exclusion = if allocation.d2SeizureHook /= None then Some "payment lock marked" else excluded
+          let exclusion = excluded
           pure (b, Quote number b.bid.lots b.bid.maxPrice exclusion)
         let result = computeResult terms (map snd verified)
-            settlement = settlementFor terms (toAnyContractId roundId)
+            settlement = settlementFor terms roundId
             winners = [(b.bid, f) | ((b, _), f) <- zip verified result.fills, f.lots > 0]
-            payments = map (\(b, f) -> paymentLeg terms b f) winners
-            deliveries = map (\(b, f) -> deliveryLeg terms b f) winners
+            payments = map (uncurry (paymentLeg terms)) winners
+            deliveries = map (uncurry (deliveryLeg terms)) winners
         assertMsg "incorrect proposed clearing result" (input.proposed == result)
         -- Each child sees only its own result. The complete list remains here.
         finished <- forA (zip input.bids result.fills) $ \(e, fill) ->
-          exercise e.accepted FinalizeBid with current = e.currentLock; fill; price = result.price
-        (issuerCash, issuerToken) <- exercise sale FinalizeSale with current = input.supply; price = result.price; payments; deliveries
-        -- A full-reference approval closes the cid/meta gap in the pinned D1
-        -- experiment. Registry D1 checks still execute in the factory below.
+          exercise e.accepted FinalizeBid with current = e.currentLock; receipt = e.currentReceipt; fill; price = result.price
+        (issuerCash, issuerToken) <- exercise sale FinalizeSale with current = input.supply; receipt = input.proceeds; price = result.price; payments; deliveries; cashArgs = input.cashArgs; tokenArgs = input.tokenArgs
+        -- The optional application approval binds the full round reference
+        -- and exact legs before either registry settles.
         forA_ terms.settlementAttester $ \attester -> do
           approval <- case input.approval of
             None -> abort "missing exact auction approval"
@@ -346,24 +456,25 @@ template Round with
         create $ EndedRound terms roundId sale accepted reason
 
 data FinalizedBid = FinalizedBid with
-    cash : [AllocationId]
-    token : [AllocationId]
+    cash : [A.FinalizedAllocation]
+    token : [A.FinalizedAllocation]
     outcome : ContractId Outcome
   deriving (Eq, Show)
 
 template AcceptedBid with
     terms : Terms
-    roundId : ContractId Proposal
+    roundId : AnyContractId
     bid : BidTerms
     lock : LockBinding
+    receipt : LockBinding
     number : Int
     credentialRoot : ContractId Credential
   where
-    signatory terms.issuer, terms.av, bidParties terms bid
-    observer terms.ao
+    signatory terms.issuer, terms.av, bid.bidder
+    observer terms.ao, bidParties terms bid
 
     choice FinalizeBid : FinalizedBid
-      with current : AllocationId; fill : Fill; price : Decimal
+      with current : AllocationId; receipt : AllocationId; fill : Fill; price : Decimal
       controller terms.av
       do
         before terms.settlementDeadline
@@ -371,19 +482,17 @@ template AcceptedBid with
         assertMsg "invalid local price or payment" (price >= terms.reserve && (fill.lots == 0 || price <= bid.maxPrice)
           && fill.payment == paymentFor terms fill.lots price && fill.payment <= paymentFor terms bid.lots bid.maxPrice)
         _ <- checkLock lock current
-        let settlement = settlementFor terms (toAnyContractId roundId)
+        _ <- checkLock this.receipt receipt
         (cash, token, recovery) <- if fill.lots == 0
           then do
-            ticket <- ticketFor terms (bidParties terms bid) lock "zero fill"
+            ticket <- ticketFor terms (bidParties terms bid) lock this.receipt "zero fill"
             pure ([], [], Some ticket)
           else do
-            assertMsg "excluded bid cannot win" (fill.exclusion == None)
-            released <- cancel terms.av current
-            cash <- allocate terms.cashRules settlement
-              (mkSpec terms.cashAdmin bid.payment terms.settlementDeadline [senderSide (paymentLeg terms bid fill)]) released
-            token <- allocate terms.tokenRules settlement
-              (mkSpec terms.tokenAdmin bid.delivery terms.settlementDeadline [receiverSide (deliveryLeg terms bid fill)]) []
-            pure ([cash], [token], None)
+            assertMsg "excluded bid cannot win" (isNone fill.exclusion)
+            -- Account consent is already carried by the two allocations.
+            -- These values add exact sides; they create no new allocations.
+            pure ([finalize current [senderSide (paymentLeg terms bid fill)]],
+                  [finalize receipt [receiverSide (deliveryLeg terms bid fill)]], None)
         outcome <- create $ Outcome terms.av terms.issuer terms.ao (bidParties terms bid) roundId number fill recovery
         pure FinalizedBid with cash; token; outcome
 
@@ -391,37 +500,36 @@ template AcceptedBid with
       with reason : Text
       controller terms.av
       do
-        ticket <- ticketFor terms (bidParties terms bid) lock reason
+        ticket <- ticketFor terms (bidParties terms bid) lock receipt reason
         create $ Outcome terms.av terms.issuer terms.ao (bidParties terms bid) roundId number (Fill number 0 0.0 (Some reason)) (Some ticket)
 
 template SaleAuthority with
     terms : Terms
-    boundRound : Optional (ContractId Proposal)
+    boundRound : Optional AnyContractId
     lock : LockBinding
+    receipt : LockBinding
   where
-    signatory terms.av, issuerParties terms
-    observer terms.ao
+    signatory terms.av, terms.issuer
+    observer terms.ao, issuerParties terms
 
     choice BindSale : ContractId SaleAuthority
-      with roundId : ContractId Proposal
+      with roundId : AnyContractId
       controller terms.av
       do
-        assertMsg "sale already bound" (boundRound == None)
+        assertMsg "sale already bound" (isNone boundRound)
         create this with boundRound = Some roundId
 
     choice AbandonSale : ContractId RecoveryTicket
       controller terms.av
       do
-        assertMsg "sale is bound to a round" (boundRound == None)
-        ticketFor terms (issuerParties terms) lock "proposal abandoned"
+        assertMsg "sale is bound to a round" (isNone boundRound)
+        ticketFor terms (issuerParties terms) lock receipt "proposal abandoned"
 
-    choice FinalizeSale : ([AllocationId], [AllocationId])
-      with current : AllocationId; price : Decimal; payments : [A.TransferLeg]; deliveries : [A.TransferLeg]
+    choice FinalizeSale : ([A.FinalizedAllocation], [A.FinalizedAllocation])
+      with current : AllocationId; receipt : AllocationId; price : Decimal; payments : [A.TransferLeg]; deliveries : [A.TransferLeg]; cashArgs : ExtraArgs; tokenArgs : ExtraArgs
       controller terms.av
       do
-        roundId <- case boundRound of
-          None -> abort "sale not bound"
-          Some cid -> pure cid
+        assertMsg "sale not bound" (isSome boundRound)
         before terms.settlementDeadline
         assertMsg "unpaired sale legs" (length payments == length deliveries)
         assertMsg "price below reserve" (price >= terms.reserve)
@@ -433,19 +541,17 @@ template SaleAuthority with
           assertMsg "invalid proceeds" (p.receiver == terms.proceeds && p.instrumentId == terms.cashInstrument
             && p.sender.owner == d.receiver.owner && p.amount == paymentFor terms lots price)
         _ <- checkLock lock current
-        released <- cancel terms.av current
-        if null payments then pure ([], []) else do
-          let settlement = settlementFor terms (toAnyContractId roundId)
-          cash <- allocate terms.cashRules settlement
-            (mkSpec terms.cashAdmin terms.proceeds terms.settlementDeadline (map receiverSide payments)) []
-          token <- allocate terms.tokenRules settlement
-            (mkSpec terms.tokenAdmin terms.inventory terms.settlementDeadline (map senderSide deliveries)) released
-          pure ([cash], [token])
+        _ <- checkLock this.receipt receipt
+        if null payments then do
+          _ <- cancel terms.av current tokenArgs
+          _ <- cancel terms.av receipt cashArgs
+          pure ([], [])
+        else pure ([finalize receipt (map receiverSide payments)], [finalize current (map senderSide deliveries)])
 
     choice CloseSaleWithoutSale : ContractId RecoveryTicket
       with reason : Text
       controller terms.av
-      do ticketFor terms (issuerParties terms) lock reason
+      do ticketFor terms (issuerParties terms) lock receipt reason
 
 -- The account parties keep visibility of their own outcome, not the whole book.
 template Outcome with
@@ -453,7 +559,7 @@ template Outcome with
     issuer : Party
     ao : Party
     parties : [Party]
-    roundId : ContractId Proposal
+    roundId : AnyContractId
     number : Int
     fill : Fill
     recovery : Optional (ContractId RecoveryTicket)
@@ -463,7 +569,7 @@ template Outcome with
 
 template ClearedRound with
     terms : Terms
-    roundId : ContractId Proposal
+    roundId : AnyContractId
     result : Result
     outcomes : [ContractId Outcome]
   where
@@ -472,7 +578,7 @@ template ClearedRound with
 
 template EndedRound with
     terms : Terms
-    roundId : ContractId Proposal
+    roundId : AnyContractId
     sale : ContractId SaleAuthority
     accepted : [ContractId AcceptedBid]
     reason : Text
@@ -491,28 +597,32 @@ template EndedRound with
       controller terms.av
       do exercise sale CloseSaleWithoutSale with reason
 
-ticketFor : Terms -> [Party] -> LockBinding -> Text -> Update (ContractId RecoveryTicket)
-ticketFor t parties lock reason = create $ RecoveryTicket t.av t.ao parties lock reason
+ticketFor : Terms -> [Party] -> LockBinding -> LockBinding -> Text -> Update (ContractId RecoveryTicket)
+ticketFor t parties lock receipt reason = create $ RecoveryTicket t.av t.ao parties lock receipt reason
 
 template RecoveryTicket with
     av : Party
     ao : Party
     parties : [Party]
     lock : LockBinding
+    receipt : LockBinding
     reason : Text
   where
     signatory av
     observer ao, parties
 
     choice Recover : [ContractId H.Holding]
-      with current : AllocationId
+      with current : AllocationId; receipt : AllocationId; fundingArgs : ExtraArgs; receiptArgs : ExtraArgs
       controller av
       do
         _ <- checkLock lock current
-        cancel av current
+        _ <- checkLock this.receipt receipt
+        returned <- cancel av current fundingArgs
+        _ <- cancel av receipt receiptArgs
+        pure returned
 
--- This prototype-specific approval binds the full settlement reference and
--- separates the two admins' leg sets. It is additional to the registry's D1.
+-- The application's optional approval binds the full settlement reference
+-- and the two admins' leg sets.
 template BatchApproval with
     attester : Party
     settlement : A.SettlementInfo

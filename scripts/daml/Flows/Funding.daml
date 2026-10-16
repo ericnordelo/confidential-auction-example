@@ -2,34 +2,95 @@ module Flows.Funding where
 
 import Daml.Script
 import DA.Assert ((===))
+import Splice.Testing.Tokens.TestTokenV2 (Token)
+import Auction.Assets
 import Auction.Workflow
 import Flows.Support
 
--- A missing provider approval and an underfunded input are different failures.
--- Both leave the preparation available. Successful funding consumes it once.
+-- Only the issuer can request round funding. A failure in proceeds creation
+-- rolls back inventory locking, and a successful request consumes its preparation.
+roundFundingGuards : Script ()
+roundFundingGuards = do
+  initial <- setup "round-funding-guards" False
+  let e = basicIssuerAccounts initial
+      t = e.terms
+  preparation <- submit (actAs t.ao <> readAs t.av) do
+    exerciseCmd (grant e Preparation) StartRound with terms = t
+  (small,smallDisclosure) <- mint e False t.inventory 99.0
+  Some grantDisclosure <- queryDisclosure @Grant t.av (grant e Preparation)
+  let disclosures = [grantDisclosure,smallDisclosure] <> e.staticDisclosures
+      args = FundRound (grant e Preparation) [small] (cashContext e) (tokenContext e)
+  submitMustFail (actAs t.ao <> readAs t.av <> discloseMany disclosures) do exerciseCmd preparation args
+  submitMustFail (actAs e.issuerProvider <> discloseMany disclosures) do exerciseCmd preparation args
+  submitMustFail (actAs t.issuer <> discloseMany disclosures) do exerciseCmd preparation args
+  assertActive t.av preparation
+  assertActive t.tokenAdmin (fromInterfaceContractId @Token small)
+  balance t.issuer t.inventory t.tokenInstrument True >>= (=== 0.0)
+
+  (rest,restDisclosure) <- mint e False t.inventory 1.0
+  let completeArgs = args with inputs = [small,rest]
+      completeDisclosures = restDisclosure :: disclosures
+  -- Inventory would lock 100, but the second registry lacks its event-log context.
+  submitMustFail (actAs t.issuer <> discloseMany completeDisclosures) do
+    exerciseCmd preparation (completeArgs with cashArgs = extra)
+  assertActive t.av preparation
+  assertActive t.tokenAdmin (fromInterfaceContractId @Token small)
+  assertActive t.tokenAdmin (fromInterfaceContractId @Token rest)
+  balance t.issuer t.inventory t.tokenInstrument True >>= (=== 0.0)
+  query @Proposal t.av >>= (\xs -> length xs === 0)
+  query @RoundFundingRequest t.av >>= (\xs -> length xs === 0)
+  -- An admission grant does not authorize preparation, even for the same parties.
+  Some wrongGrant <- queryDisclosure @Grant t.av (grant e Admission)
+  submitMustFail (actAs t.issuer <> discloseMany (wrongGrant :: completeDisclosures)) do
+    exerciseCmd preparation (completeArgs with preparation = grant e Admission)
+  FundedRound proposal <- submitRoundFunding e preparation [small,rest]
+  assertGone t.av preparation
+  assertActive t.av proposal
+  another <- submit (actAs t.ao <> readAs t.av) do
+    exerciseCmd (grant e Preparation) StartRound with terms = t
+  submitMustFail (actAs t.issuer <> discloseMany completeDisclosures) do exerciseCmd another completeArgs
+  -- Funding at the bidding cutoff is too late, even with fresh inventory.
+  (fresh,freshDisclosure) <- mint e False t.inventory 100.0
+  setTime t.biddingDeadline
+  submitMustFail (actAs t.issuer <> discloseMany (freshDisclosure :: disclosures)) do
+    exerciseCmd another (args with inputs = [fresh])
+  submit t.issuer do exerciseCmd another AbandonRoundPreparation
+  assertGone t.av another
+
+-- Immediate allocation rejects insufficient funds. Failure in the second
+-- registry also restores the first allocation, the bid and all input holdings.
 fundingGuards : Script ()
 fundingGuards = do
   e <- setup "funding" False
   let t = e.terms
-      b = bidTerms e e.alice 5 12.0
+      b = bidTerms e e.bob 5 12.0
   (round, published, _) <- openRound e
-  p0 <- submit (actAs t.ao <> readAs t.av) do exerciseCmd (grant e Preparation) StartBid with published; bid = b
-  p1 <- submit e.alice do exerciseCmd p0 ApproveBid with approver = e.alice
   (small, smallDisclosure) <- mint e True b.payment 599.0
-  submitMustFail (actAs t.ao <> readAs t.av <> discloseMany (smallDisclosure :: e.disclosures)) do
-    exerciseCmd p1 FundBid with inputs = [small]
-  p2 <- submit e.aliceProvider do exerciseCmd p1 ApproveBid with approver = e.aliceProvider
-  submitMustFail (actAs t.ao <> readAs t.av <> discloseMany (smallDisclosure :: e.disclosures)) do
-    exerciseCmd p2 FundBid with inputs = [small]
-  assertActive t.av p2
-  balance e.alice b.payment t.cashInstrument True >>= (=== 0.0)
-  balance e.alice b.payment t.cashInstrument False >>= (=== 599.0)
+  Some publishedDisclosure <- queryDisclosure @PublishedTerms t.av published
+  Some preparationDisclosure <- queryDisclosure @Grant t.av (grant e Preparation)
+  let disclosures = [publishedDisclosure,preparationDisclosure,smallDisclosure] <> e.staticDisclosures
+      args = SubmitBid (grant e Preparation) b [small] (cashContext e) (tokenContext e)
+  submitMustFail (actAs e.bob <> discloseMany disclosures) do exerciseCmd published args
+  assertActive t.cashAdmin (fromInterfaceContractId @Token small)
+  query @PreparedBid t.av >>= (\xs -> length xs === 0)
+  balance e.bob b.payment t.cashInstrument True >>= (=== 0.0)
+  balance e.bob b.payment t.cashInstrument False >>= (=== 599.0)
 
   (rest, restDisclosure) <- mint e True b.payment 1.0
-  prepared <- submit (actAs t.ao <> readAs t.av <> discloseMany ([smallDisclosure,restDisclosure] <> e.disclosures)) do
-    exerciseCmd p2 FundBid with inputs = [small,rest]
-  assertActive t.av prepared
-  balance e.alice b.payment t.cashInstrument True >>= (=== 600.0)
+  -- Cash would allocate 600, but the token factory lacks required context.
+  submitMustFail (actAs e.bob <> discloseMany (restDisclosure :: disclosures)) do
+    exerciseCmd published (args with inputs = [small,rest]; tokenArgs = extra)
+  assertActive t.cashAdmin (fromInterfaceContractId @Token small)
+  assertActive t.cashAdmin (fromInterfaceContractId @Token rest)
+  query @PreparedBid t.av >>= (\xs -> length xs === 0)
+  query @BidRequest t.av >>= (\xs -> length xs === 0)
+  balance e.bob b.payment t.cashInstrument True >>= (=== 0.0)
+
+  source@(FundedBid prepared) <- submitBid e published b [small,rest]
+  assertSourceActive e source
+  balance e.bob b.payment t.cashInstrument True >>= (=== 600.0)
   assertActive t.av round
-  submitMustFail (actAs t.ao <> readAs t.av <> discloseMany e.disclosures) do
-    exerciseCmd p2 FundBid with inputs = []
+  -- Reusing the consumed inputs cannot fund a second bid.
+  submitMustFail (actAs e.bob <> discloseMany (restDisclosure :: disclosures)) do
+    exerciseCmd published (args with inputs = [small,rest])
+  assertActive t.av prepared

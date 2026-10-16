@@ -1,6 +1,6 @@
 module Auction.Types where
 
-import DA.Optional (fromOptional)
+import DA.Optional (fromOptional, isNone)
 
 import DA.List (dedupSort, sortOn)
 
@@ -9,7 +9,7 @@ import Splice.Api.Token.HoldingV2 qualified as H
 import Splice.Api.Token.AllocationV2 qualified as A
 import Splice.Api.Token.MetadataV1
 import Splice.TokenStandard.Utils (accountParties)
-import OpenZeppelin.TokenCIP112V1.Registry (TokenRules)
+import Splice.Testing.Tokens.TestTokenV2 (TokenRules)
 
 -- Fixed terms are copied into each consent contract. Account consent cannot
 -- be redirected later by changing an argument on an operator choice.
@@ -116,7 +116,7 @@ fillBands qs remaining (price :: prices) =
 computeResult : Terms -> [Quote] -> Result
 computeResult t qs = Result price (map fill qs)
   where
-    eligible = filter (\q -> q.exclusion == None) qs
+    eligible = filter (\q -> isNone q.exclusion) qs
     amounts = bandFills t.supplyLots eligible
     amount n = fromOptional 0 (lookup n amounts)
     winning = filter (\q -> amount q.number > 0) eligible

@@ -15,6 +15,8 @@ auditResult = do
   e <- setup "audit" False
   let t = e.terms
   (r0, published, supply) <- openRound e
+  Some initialRound <- queryContractId e.terms.av r0
+  let receipt = initialRound.proceedsReceipt.root
   inputs <- mapA (prepareBid e published) [bidTerms e e.alice 5 12.0, bidTerms e e.bob 8 10.0, bidTerms e e.carol 4 10.0]
   admitted <- acceptBatch e r0 supply inputs
   closed <- closeRound e admitted

@@ -4,13 +4,9 @@ import Daml.Script
 import DA.Assert ((===))
 import DA.List (head)
 import DA.Time (addRelTime, hours)
-import DA.TextMap qualified as TM
-import Splice.Api.Token.HoldingV2 qualified as H
-import Splice.Api.Token.MetadataV1
-import Splice.TokenStandard.Utils (toAnyContractId)
-import OpenZeppelin.TokenCIP112V1.Allocation
-import OpenZeppelin.TokenCIP112V1.Base
-import OpenZeppelin.TokenCIP112V1.D1
+import Splice.Api.Token.AllocationV2 qualified as A
+import Auction.Assets
+import Splice.Testing.Tokens.TestTokenV2.Allocation
 import Auction.Types
 import Auction.Eligibility
 import Auction.Workflow
@@ -22,6 +18,8 @@ credentialRevocation : Script ()
 credentialRevocation = do
   e <- setup "credential" False
   (r0, published, supply) <- openRound e
+  Some initialRound <- queryContractId e.terms.av r0
+  let receipt = initialRound.proceedsReceipt.root
   bid <- prepareBid e published (bidTerms e e.alice 5 12.0)
   r1 <- acceptBatch e r0 supply [bid]
   status <- submit e.terms.eligibilityProvider do
@@ -36,87 +34,79 @@ credentialRevocation = do
   Some result <- queryContractId e.terms.av cleared
   result.result === Result 8.0 [Fill 0 0 0.0 (Some "credential revoked")]
 
--- D2 consumes the original allocation. The auction authenticates its successor
--- by root, exact specification and still-live funding. A mark blocks recovery.
-markedPayment : Script ()
-markedPayment = do
-  e <- setup "marked" False
+-- An externally cancelled allocation is missing funding, not an eligibility
+-- exclusion. The complete clear fails and preserves every auction record.
+cancelledPaymentBlocksClear : Script ()
+cancelledPaymentBlocksClear = do
+  e <- setup "cancelled" False
   (r0, published, supply) <- openRound e
   bid <- prepareBid e published (bidTerms e e.alice 5 12.0)
   r1 <- acceptBatch e r0 supply [bid]
-  marked <- submit e.terms.cashAdmin do
-    exerciseCmd (fromInterfaceContractId @TokenAllocation bid.currentLock) TokenAllocation_MarkD2Seizure with
-      seizureHook = D2SeizureHook "case-1" (H.Account (Some e.outsider) None "custodian") "held" (addRelTime e.start (hours 1))
+  e <- withRegistryDisclosures e
+  _ <- submit (actAs e.terms.av <> discloseMany e.disclosures) do
+    exerciseCmd bid.currentLock A.Allocation_Cancel with actors = [e.terms.av]; extraArgs = cashContext e
   closed <- closeRound e r1
-  input <- clearInput e closed supply [bid with currentLock = toInterfaceContractId marked]
-  _ <- clearRound e closed input
-  [(_, outcome)] <- query @Outcome e.alice
-  outcome.fill.exclusion === Some "payment lock marked"
-  Some ticket <- pure outcome.recovery
-  submitMustFail (actAs e.terms.ao <> readAs e.terms.av) do
-    exerciseCmd (grant e Recovery) Release with ticket; current = toInterfaceContractId marked
-  unmarked <- submit e.terms.cashAdmin do exerciseCmd marked TokenAllocation_UnmarkD2Seizure
-  _ <- submit (actAs e.terms.ao <> readAs e.terms.av) do exerciseCmd (grant e Recovery) Release with ticket; current = toInterfaceContractId unmarked
-  balance e.alice (bidTerms e e.alice 5 12.0).payment e.terms.cashInstrument False >>= (=== 600.0)
+  input <- clearInput e closed supply [bid]
+  submitMustFail (actAs e.terms.ao <> readAs e.terms.av <> discloseMany e.disclosures) do
+    exerciseCmd (grant e Clearing) ClearRound with round = closed; input
+  assertActive e.terms.av closed
+  balance e.terms.issuer e.terms.proceeds e.terms.cashInstrument False >>= (=== 0.0)
+  balance e.alice (bidTerms e e.alice 5 12.0).delivery e.terms.tokenInstrument False >>= (=== 0.0)
 
--- The token registry requires real D1 approval. The first attempt deliberately
--- omits it, causing failure AFTER the cash registry call inside Round_Clear.
--- Ledger rollback must restore the cash, bids, locks and application approval.
+-- Missing Splice account context makes the second registry fail AFTER cash
+-- settlement. Rollback restores both assets, all allocations and the approval.
 atomicRollbackAndRetry : Script ()
 atomicRollbackAndRetry = do
   e <- setup "rollback" True
   let t = e.terms
       bidTermsA = bidTerms e e.alice 5 12.0
   (r0, published, supply) <- openRound e
+  Some initialRound <- queryContractId e.terms.av r0
+  let receipt = initialRound.proceedsReceipt.root
   bid <- prepareBid e published bidTermsA
   r1 <- acceptBatch e r0 supply [bid]
   closed <- closeRound e r1
   input0 <- clearInput e closed supply [bid]
   Some r <- queryContractId t.av closed
-  let settlement = settlementFor t (toAnyContractId r.roundId)
+  let settlement = settlementFor t r.roundId
       fill = head input0.proposed.fills
       payments = [paymentLeg t bidTermsA fill]
       deliveries = [deliveryLeg t bidTermsA fill]
   approval <- submit e.attester do
     createCmd $ BatchApproval e.attester settlement payments deliveries t.settlementDeadline
-  let input = input0 with approval = Some approval
+  e <- withRegistryDisclosures e
+  let input = input0 with approval = Some approval; tokenArgs = extra
   submitMustFail (actAs t.ao <> readAs t.av <> discloseMany e.disclosures) do
     exerciseCmd (grant e Clearing) ClearRound with round = closed; input
   assertActive t.av closed
   assertActive t.av (head r.accepted)
-  assertActive t.av (fromInterfaceContractId @TokenAllocation bid.currentLock)
-  assertActive t.av (fromInterfaceContractId @TokenAllocation supply)
+  assertActive t.av (fromInterfaceContractId @TokenAllocationV2 bid.currentLock)
+  assertActive t.av (fromInterfaceContractId @TokenAllocationV2 supply)
+  assertActive t.av (fromInterfaceContractId @TokenAllocationV2 bid.currentReceipt)
+  assertActive t.av (fromInterfaceContractId @TokenAllocationV2 receipt)
   assertActive t.av approval
   balance t.issuer t.proceeds t.cashInstrument False >>= (=== 0.0)
   balance e.alice bidTermsA.payment t.cashInstrument True >>= (=== 600.0)
   query @Outcome e.alice >>= (\xs -> length xs === 0)
 
-  -- The attester then signs the exact token legs for the registry's D1 hook.
-  -- The application approval above additionally binds SettlementInfo.cid/meta.
-  now <- getTime
-  attestation <- submit e.attester do
-    createCmd ComplianceAttestation with
-      attester = e.attester; attestationObservers = []
-      settlementId = settlement.id; authorizedExecutors = [t.av]
-      claimKind = "approved"; complianceReference = "approved-auction"
-      issuedAt = now; expiresAt = t.settlementDeadline; boundTransferLegs = deliveries
-  let args = ExtraArgs (ChoiceContext (TM.fromList [(d1AttestationContextKey, AV_ContractId (toAnyContractId attestation))])) emptyMetadata
-  _ <- clearRound e closed (input with tokenArgs = args)
+  -- A retry supplies the actual upstream account policies and event log.
+  _ <- clearRound e closed (input with tokenArgs = tokenContext e)
   balance t.issuer t.proceeds t.cashInstrument False >>= (=== 400.0)
   balance e.alice bidTermsA.delivery t.tokenInstrument False >>= (=== 50.0)
   assertGone t.av approval
-  assertGone t.av attestation
 
 -- Governance can pause admission while preserving close, expiry and recovery.
 pauseAdmission : Script ()
 pauseAdmission = do
   e <- setup "pause" False
   (round, published, supply) <- openRound e
-  bid <- prepareBid e published (bidTerms e e.alice 5 12.0)
+  Some initialRound <- queryContractId e.terms.av round
+  let receipt = initialRound.proceedsReceipt.root
+  bid <- prepareBid e published (bidTerms e e.bob 5 12.0)
   submit e.terms.av do archiveCmd (grant e Admission)
   submitMustFail (actAs e.terms.ao <> readAs e.terms.av) do
-    exerciseCmd (grant e Admission) AcceptBatch with round; supply; bids = [bid]
+    exerciseCmd (grant e Admission) AcceptBatch with round; supply; receipt; bids = [bid]
   _ <- closeRound e round
-  ticket <- submit e.alice do exerciseCmd bid.prepared WithdrawPreparedBid
-  _ <- submit (actAs e.terms.ao <> readAs e.terms.av) do exerciseCmd (grant e Recovery) Release with ticket; current = bid.currentLock
+  ticket <- submit e.bob do exerciseCmd (preparedId bid) WithdrawPreparedBid
+  _ <- releaseTicket e ticket bid.currentLock bid.currentReceipt
   pure ()

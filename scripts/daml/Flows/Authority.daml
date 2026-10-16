@@ -4,7 +4,6 @@ import Daml.Script
 import DA.Assert ((===))
 import DA.List (head)
 import Splice.Api.Token.AllocationV2 qualified as A
-import Splice.TokenStandard.Utils (toAnyContractId, nonIteratedAllocation)
 import Auction.Types
 import Auction.Assets
 import Auction.Workflow
@@ -16,19 +15,21 @@ operatorCannotBypass : Script ()
 operatorCannotBypass = do
   e <- setup "authority" False
   (r0, published, supply) <- openRound e
+  Some initialRound <- queryContractId e.terms.av r0
+  let receipt = initialRound.proceedsReceipt.root
   bid <- prepareBid e published (bidTerms e e.alice 5 12.0)
   r1 <- acceptBatch e r0 supply [bid]
   Some r <- queryContractId e.terms.av r1
   submitMustFail (actAs e.terms.ao <> readAs e.terms.av) do exerciseCmd bid.currentLock A.Allocation_Cancel with actors = [e.terms.av]; extraArgs = extra
-  submitMustFail (actAs e.terms.ao <> readAs e.terms.av) do exerciseCmd (head r.accepted) FinalizeBid with current = bid.currentLock; fill = Fill 0 5 400.0 None; price = 8.0
+  submitMustFail (actAs e.terms.ao <> readAs e.terms.av) do exerciseCmd (head r.accepted) FinalizeBid with current = bid.currentLock; receipt = bid.currentReceipt; fill = Fill 0 5 400.0 None; price = 8.0
   submitMustFail e.outsider do
     exerciseCmd (grant e Clearing) ClearRound with
       round = r1
-      input = ClearInput [] supply (Result 8.0 []) None extra extra
+      input = ClearInput [] supply receipt (Result 8.0 []) None extra extra
   assertActive e.terms.av (head r.accepted)
 
--- Deliberate counterexample, not an approved operator workflow. av itself can
--- invoke subordinate choices, then settle only cash. This proves that atomic
+-- Privileged av can finalize and settle only payment allocations. This
+-- counterexample shows why governance must restrict direct av submission: atomic
 -- DvP depends on av following the approved clear and on its governance.
 -- A 2-of-3 hosting rule alone does not restrict all possible av submissions.
 validationPartyTrustBoundary : Script ()
@@ -38,23 +39,26 @@ validationPartyTrustBoundary = do
       b = bidTerms e e.alice 5 12.0
       fill = Fill 0 5 400.0 None
   (r0, published, supply) <- openRound e
+  Some initialRound <- queryContractId e.terms.av r0
+  let receipt = initialRound.proceedsReceipt.root
   bid <- prepareBid e published b
   r1 <- acceptBatch e r0 supply [bid]
   Some r <- queryContractId t.av r1
 
+  e <- withRegistryDisclosures e
   -- These are separate submissions by av. They intentionally bypass Round_Clear.
   finalized <- submit (actAs t.av <> discloseMany e.disclosures) do
-    exerciseCmd (head r.accepted) FinalizeBid with current = bid.currentLock; fill; price = 8.0
+    exerciseCmd (head r.accepted) FinalizeBid with current = bid.currentLock; receipt = bid.currentReceipt; fill; price = 8.0
   (issuerCash, _) <- submit (actAs t.av <> discloseMany e.disclosures) do
     exerciseCmd r.sale FinalizeSale with
-      current = supply; price = 8.0
-      payments = [paymentLeg t b fill]; deliveries = [deliveryLeg t b fill]
+      current = supply; receipt; price = 8.0
+      payments = [paymentLeg t b fill]; deliveries = [deliveryLeg t b fill]; cashArgs = cashContext e; tokenArgs = tokenContext e
   _ <- submit (actAs t.av <> discloseMany e.disclosures) do
     exerciseCmd (toInterfaceContractId @A.SettlementFactory t.cashRules) A.SettlementFactory_SettleBatch with
-      settlement = settlementFor t (toAnyContractId r.roundId)
+      settlement = settlementFor t r.roundId
       transferLegs = [paymentLeg t b fill]
-      allocations = map nonIteratedAllocation (finalized.cash <> issuerCash)
-      actors = [t.av]; extraArgs = extra
+      allocations = finalized.cash <> issuerCash
+      actors = [t.av]; extraArgs = cashContext e
   balance t.issuer t.proceeds t.cashInstrument False >>= (=== 400.0)
   balance e.alice b.delivery t.tokenInstrument False >>= (=== 0.0)
   assertActive t.av r1

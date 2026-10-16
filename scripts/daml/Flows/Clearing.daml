@@ -18,7 +18,10 @@ happyPath = do
       c = bidTerms e e.carol 4 10.0
   -- The issuer and provider approve inventory funding. ao then opens the round.
   (r0, published, supply) <- openRound e
-  -- Each bidder approves its own terms and account use before ao funds the bid.
+  Some initialRound <- queryContractId e.terms.av r0
+  let receipt = initialRound.proceedsReceipt.root
+  -- Each bidder submits its terms and requests both allocations. Alice's
+  -- provider completes her registry instructions before batch admission.
   bids <- mapA (prepareBid e published) [a,b,c]
   -- One operator transaction admits all three bids and advances the round once.
   r1 <- acceptBatch e r0 supply bids
@@ -33,8 +36,8 @@ happyPath = do
   submitMustFail (actAs t.ao <> readAs t.av <> discloseMany e.disclosures) do
     exerciseCmd (grant e Clearing) ClearRound with round = closed; input = input with bids = []
 
-  -- ao is the only submitter. AcceptedBid and SaleAuthority contribute the
-  -- account signatures to their own nested allocation-factory calls.
+  -- ao is the only submitter. Existing allocations carry account consent.
+  -- Finalization attaches exact sides and refunds unused funding with None.
   -- Round_Clear recomputes the result and settles both assets in one transaction.
   cleared <- clearRound e closed input
   Some result <- queryContractId t.av cleared
@@ -53,6 +56,8 @@ emptyRound : Script ()
 emptyRound = do
   e <- setup "empty" False
   (round, _, supply) <- openRound e
+  Some initialRound <- queryContractId e.terms.av round
+  let receipt = initialRound.proceedsReceipt.root
   closed <- closeRound e round
   input <- clearInput e closed supply []
   cleared <- clearRound e closed input

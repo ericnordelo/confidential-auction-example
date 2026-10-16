@@ -4,13 +4,13 @@ module Flows.Support where
 
 import Daml.Script
 import DA.Action (foldlA)
-import DA.Time (addRelTime, days, hours, minutes, milliseconds)
+import DA.TextMap qualified as TM
+import DA.Time (addRelTime, hours, minutes, milliseconds)
 import Splice.Api.Token.HoldingV2 qualified as H
+import Splice.Api.Token.AllocationInstructionV2 qualified as F
+import Splice.Api.Token.MetadataV1 (ExtraArgs)
 import Splice.TokenStandard.Utils (accountParties)
-import OpenZeppelin.TokenCIP112V1.Registry
-import OpenZeppelin.TokenCIP112V1.Holding
-import OpenZeppelin.TokenCIP112V1.Allocation
-import OpenZeppelin.TokenCIP112V1.D1
+import Splice.Testing.Tokens.TestTokenV2
 import Auction.Types
 import Auction.Assets
 import Auction.Eligibility
@@ -28,7 +28,10 @@ data Env = Env with
     attester : Party
     grants : [(GrantKind, ContractId Grant)]
     disclosures : [Disclosure]
+    staticDisclosures : [Disclosure]
     start : Time
+    cashConfigs : [ContractId AccountConfig]
+    tokenConfigs : [ContractId AccountConfig]
 
 grant : Env -> GrantKind -> ContractId Grant
 grant e kind = case lookup kind e.grants of
@@ -42,7 +45,7 @@ setup = setupWith allocateParty
 
 -- Network demonstrations supply an allocator that routes each role to its host.
 setupWith : (Text -> Script Party) -> Text -> Bool -> Script Env
-setupWith allocate prefix requireD1 = do
+setupWith allocate prefix requireApproval = do
   issuer <- allocate (prefix <> "-issuer")
   issuerProvider <- allocate (prefix <> "-issuer-provider")
   av <- allocate (prefix <> "-validation")
@@ -57,26 +60,27 @@ setupWith allocate prefix requireD1 = do
   outsider <- allocate (prefix <> "-outsider")
   attester <- allocate (prefix <> "-attester")
   start <- getTime
-  trusted <- if requireD1 then do
-    cid <- submit tokenAdmin do createCmd $ TrustedAttesterRegistry tokenAdmin [attester] ["approved"]
-    Some disclosure <- queryDisclosure @TrustedAttesterRegistry tokenAdmin cid
-    pure (Some cid, [disclosure])
-    else pure (None, [])
-  let rules admin required = TokenRules admin (days 1) (hours 1) (hours 1) required (hours 1) None (Some [av])
-  cashRules <- submit cashAdmin do createCmd (rules cashAdmin None)
-  tokenRules <- submit tokenAdmin do createCmd (rules tokenAdmin trusted._1)
+  cashRules <- submit cashAdmin do createCmd $ TokenRules cashAdmin
+  tokenRules <- submit tokenAdmin do createCmd $ TokenRules tokenAdmin
   Some cashDisclosure <- queryDisclosure @TokenRules cashAdmin cashRules
   Some tokenDisclosure <- queryDisclosure @TokenRules tokenAdmin tokenRules
+  -- Account policies are agreed once. Allocation instructions can later collect
+  -- the owner and provider approvals in separate registry transactions.
+  let inventory = H.Account (Some issuer) (Some issuerProvider) "inventory"
+      proceeds = H.Account (Some issuer) (Some issuerProvider) "proceeds"
+      payment = H.Account (Some alice) (Some aliceProvider) "payment"
+      delivery = H.Account (Some alice) (Some aliceProvider) "delivery"
+  cashAccounts <- mapA (createAccountConfig cashAdmin) [proceeds, payment]
+  tokenAccounts <- mapA (createAccountConfig tokenAdmin) [inventory, delivery]
   grants <- forA [Preparation, Opening, Admission, Closing, Clearing, Termination, Recovery] $ \kind -> do
     cid <- submit av do createCmd Grant with av; ao; kind
     pure (kind, cid)
   let terms = Terms with
         issuer; av; ao; eligibilityProvider; cashAdmin; tokenAdmin; cashRules; tokenRules
-        settlementAttester = if requireD1 then Some attester else None
+        settlementAttester = if requireApproval then Some attester else None
         cashInstrument = "USD"
         tokenInstrument = "ISSUE"
-        inventory = H.Account (Some issuer) (Some issuerProvider) "inventory"
-        proceeds = H.Account (Some issuer) (Some issuerProvider) "proceeds"
+        inventory; proceeds
         supplyLots = 10
         lotSize = 10.0
         reserve = 8.0
@@ -88,8 +92,26 @@ setupWith allocate prefix requireD1 = do
         maxBatch = 8
   pure Env with
     terms; issuerProvider; alice; aliceProvider; bob; carol; outsider; attester; grants
-    disclosures = cashDisclosure :: tokenDisclosure :: trusted._2
-    start
+    disclosures = cashDisclosure :: tokenDisclosure :: map snd (cashAccounts <> tokenAccounts)
+    staticDisclosures = cashDisclosure :: tokenDisclosure :: map snd (cashAccounts <> tokenAccounts)
+    start; cashConfigs = map fst cashAccounts; tokenConfigs = map fst tokenAccounts
+
+
+createAccountConfig : Party -> H.Account -> Script (ContractId AccountConfig, Disclosure)
+createAccountConfig admin account = do
+  let config = AccountConfig admin account (PartyConfig True True) (PartyConfig True True)
+  Some provider <- pure account.provider
+  Some owner <- pure account.owner
+  proposal <- submit provider do createCmd $ AccountProposal config
+  result <- submit owner do exerciseCmd proposal AccountProposal_Accept
+  Some disclosure <- queryDisclosure @AccountConfig admin result.accountConfig
+  pure (result.accountConfig, disclosure)
+
+cashContext : Env -> ExtraArgs
+cashContext e = registryArgs e.terms.cashRules e.cashConfigs
+
+tokenContext : Env -> ExtraArgs
+tokenContext e = registryArgs e.terms.tokenRules e.tokenConfigs
 
 bidTerms : Env -> Party -> Int -> Decimal -> BidTerms
 bidTerms e owner lots maxPrice =
@@ -111,51 +133,121 @@ mint e cash account amount = do
     awaitVisible approver cid
     submit approver do exerciseCmd cid ApproveMint with approver) request (accountParties admin account)
   awaitVisible admin consent
-  cid <- submit (actAs admin <> discloseMany e.disclosures) do exerciseCmd consent MintFixture
-  Some disclosure <- queryDisclosure @TokenHolding admin cid
+  cid <- submit (actAs admin <> discloseMany e.disclosures) do exerciseCmd consent MintFixture with args = if cash then cashContext e else tokenContext e
+  Some disclosure <- queryDisclosure @Token admin cid
   pure (toInterfaceContractId cid, disclosure)
 
--- The issuer and its provider sign in separate transactions. Only the final
--- funding transaction needs the holding disclosure, then ao submits alone.
-prepareRound : Env -> Script (ContractId Proposal, AllocationId)
+-- Basic issuer accounts finish both requests with the owner's authority alone.
+basicIssuerAccounts : Env -> Env
+basicIssuerAccounts e = e with
+  terms = e.terms with
+    inventory = e.terms.inventory with provider = None
+    proceeds = e.terms.proceeds with provider = None
+
+-- The issuer submits alone. A live grant and registry context provide visibility.
+submitRoundFunding : Env -> ContractId RoundPreparation -> [ContractId H.Holding] -> Script RoundSource
+submitRoundFunding e preparation inputs = do
+  awaitVisible e.terms.issuer preparation
+  Some preparationDisclosure <- queryDisclosure @Grant e.terms.av (grant e Preparation)
+  inputDisclosures <- forA inputs $ \cid -> do
+    Some disclosure <- queryDisclosure @Token e.terms.tokenAdmin (fromInterfaceContractId cid)
+    pure disclosure
+  submit (actAs e.terms.issuer <> discloseMany (preparationDisclosure :: inputDisclosures <> e.staticDisclosures)) do
+    exerciseCmd preparation FundRound with
+      preparation = grant e Preparation; inputs; cashArgs = cashContext e; tokenArgs = tokenContext e
+
+-- Providers act through their registries. The auction request stays unchanged.
+completeRoundFunding : Env -> RoundSource -> Script (AllocationId, AllocationId)
+completeRoundFunding e source = case source of
+  FundedRound cid -> do
+    Some p <- queryContractId e.terms.av cid
+    pure (p.lock.root, p.receipt.root)
+  RegistryPreparedRound cid -> do
+    Some request <- queryContractId e.terms.av cid
+    supply <- completeAllocation e False request.inventory
+    receipt <- completeAllocation e True request.receipt
+    pure (supply, receipt)
+
+-- A signed funding request carries fixed terms while custody approval completes.
+prepareRound : Env -> Script (RoundSource, AllocationId, AllocationId)
 prepareRound e = do
   p0 <- submit (actAs e.terms.ao <> readAs e.terms.av) do exerciseCmd (grant e Preparation) StartRound with terms = e.terms
-  p1 <- submit e.terms.issuer do exerciseCmd p0 ApproveRound with approver = e.terms.issuer
-  p2 <- submit e.issuerProvider do exerciseCmd p1 ApproveRound with approver = e.issuerProvider
-  (holding, disclosure) <- mint e False e.terms.inventory (intToDecimal e.terms.supplyLots * e.terms.lotSize)
-  proposal <- submit (actAs e.terms.ao <> readAs e.terms.av <> discloseMany (disclosure :: e.disclosures)) do
-    exerciseCmd p2 FundRound with inputs = [holding]
-  Some p <- queryContractId e.terms.av proposal
-  pure (proposal, p.lock.root)
+  (holding, _) <- mint e False e.terms.inventory (intToDecimal e.terms.supplyLots * e.terms.lotSize)
+  source <- submitRoundFunding e p0 [holding]
+  (supply, receipt) <- completeRoundFunding e source
+  pure (source, supply, receipt)
 
 openRound : Env -> Script (ContractId Round, ContractId PublishedTerms, AllocationId)
 openRound e = do
-  (proposal, supply) <- prepareRound e
-  (round, published) <- submit (actAs e.terms.ao <> readAs e.terms.av) do exerciseCmd (grant e Opening) OpenRound with proposal; supply
+  (source, supply, receipt) <- prepareRound e
+  (round, published) <- submit (actAs e.terms.ao <> readAs e.terms.av) do exerciseCmd (grant e Opening) OpenRound with source; supply; receipt
   pure (round, published, supply)
 
--- Each bid has its own preparation state, consent transactions and payment
--- input. Preparing these bids does not consume the shared round contract.
+-- One bidder submission signs the bid and requests both registry allocations.
+-- Published terms and the live preparation grant are disclosed to the bidder.
+submitBid : Env -> ContractId PublishedTerms -> BidTerms -> [ContractId H.Holding] -> Script BidSource
+submitBid e published bid inputs = do
+  Some publishedDisclosure <- queryDisclosure @PublishedTerms e.terms.av published
+  Some preparationDisclosure <- queryDisclosure @Grant e.terms.av (grant e Preparation)
+  inputDisclosures <- forA inputs $ \cid -> do
+    Some disclosure <- queryDisclosure @Token e.terms.cashAdmin (fromInterfaceContractId cid)
+    pure disclosure
+  submit (actAs bid.bidder <> discloseMany ([publishedDisclosure,preparationDisclosure] <> inputDisclosures <> e.staticDisclosures)) do
+    exerciseCmd published SubmitBid with
+      preparation = grant e Preparation; bid; inputs; cashArgs = cashContext e; tokenArgs = tokenContext e
+
+-- Pending approvals use only registry choices. The application request remains
+-- unchanged, and a fresh holding disclosure is supplied at provider completion.
+completeAllocation : Env -> Bool -> F.AllocationInstructionResult_Output -> Script AllocationId
+completeAllocation e cash output = case output of
+  F.AllocationInstructionResult_Completed cid -> pure cid
+  F.AllocationInstructionResult_Pending cid -> do
+    let admin = if cash then e.terms.cashAdmin else e.terms.tokenAdmin
+    Some instruction <- queryContractId admin (fromInterfaceContractId @TokenAllocationInstructionV2 cid)
+    Some provider <- pure instruction.allocation.authorizer.provider
+    inputDisclosures <- forA (concatMap snd (TM.toList instruction.inputHoldingCids)) $ \holding -> do
+      Some disclosure <- queryDisclosure @Token admin (fromInterfaceContractId holding)
+      pure disclosure
+    awaitVisible provider (fromInterfaceContractId @TokenAllocationInstructionV2 cid)
+    result <- submit (actAs provider <> discloseMany (inputDisclosures <> e.staticDisclosures)) do
+      exerciseCmd cid F.AllocationInstruction_Accept with
+        actors = [provider]; extraArgs = if cash then cashContext e else tokenContext e
+    case result.output of
+      F.AllocationInstructionResult_Completed allocation -> pure allocation
+      _ -> abort "provider approval did not complete the allocation"
+  F.AllocationInstructionResult_Failed -> abort "allocation request failed"
+
+completeBid : Env -> BidSource -> Script (AllocationId, AllocationId)
+completeBid e source = case source of
+  FundedBid cid -> do
+    Some b <- queryContractId e.terms.av cid
+    pure (b.lock.root, b.receipt.root)
+  RegistryPreparedBid cid -> do
+    Some b <- queryContractId e.terms.av cid
+    payment <- completeAllocation e True b.payment
+    receipt <- completeAllocation e False b.receipt
+    pure (payment, receipt)
+
+-- Each bid has distinct inputs and application state. Custodian approvals
+-- complete through the registry before the operator can accept the bid.
 prepareBid : Env -> ContractId PublishedTerms -> BidTerms -> Script AdmissionInput
 prepareBid e published bid = do
-  Some pDisclosure <- queryDisclosure @PublishedTerms e.terms.av published
-  p <- submit (actAs e.terms.ao <> readAs e.terms.av <> discloseMany [pDisclosure]) do
-    exerciseCmd (grant e Preparation) StartBid with published; bid
-  signed <- foldlA (\cid approver -> do
-    awaitVisible approver cid
-    submit approver do exerciseCmd cid ApproveBid with approver) p (bidParties e.terms bid)
-  (holding, disclosure) <- mint e True bid.payment (paymentFor e.terms bid.lots bid.maxPrice)
-  awaitVisible e.terms.ao signed
-  prepared <- submit (actAs e.terms.ao <> readAs e.terms.av <> discloseMany (disclosure :: e.disclosures)) do
-    exerciseCmd signed FundBid with inputs = [holding]
-  Some b <- queryContractId e.terms.av prepared
-  credential <- submit e.terms.eligibilityProvider do
-    createCmd $ Credential e.terms.eligibilityProvider bid.bidder e.terms.av None (addRelTime e.start (hours 1)) False
-  pure AdmissionInput with prepared; currentLock = b.lock.root; credential
+  (holding, _) <- mint e True bid.payment (paymentFor e.terms bid.lots bid.maxPrice)
+  prepared <- submitBid e published bid [holding]
+  (currentLock, currentReceipt) <- completeBid e prepared
+  credential <- issueCredential e bid.bidder
+  pure AdmissionInput with prepared; currentLock; currentReceipt; credential
+
+issueCredential : Env -> Party -> Script (ContractId Credential)
+issueCredential e bidder =
+  submit e.terms.eligibilityProvider do
+    createCmd $ Credential e.terms.eligibilityProvider bidder e.terms.av None (addRelTime e.start (hours 1)) False
 
 acceptBatch : Env -> ContractId Round -> AllocationId -> [AdmissionInput] -> Script (ContractId Round)
-acceptBatch e round supply bids = submit (actAs e.terms.ao <> readAs e.terms.av) do
-  exerciseCmd (grant e Admission) AcceptBatch with round; supply; bids
+acceptBatch e round supply bids = do
+  Some r <- queryContractId e.terms.av round
+  submit (actAs e.terms.ao <> readAs e.terms.av) do
+    exerciseCmd (grant e Admission) AcceptBatch with round; supply; receipt = r.proceedsReceipt.root; bids
 
 closeRound : Env -> ContractId Round -> Script (ContractId Round)
 closeRound e round = do
@@ -170,25 +262,25 @@ clearInput e round supply inputs = do
   bids <- forA (zip r.accepted inputs) $ \(accepted, i) -> do
     Some b <- queryContractId e.terms.av accepted
     Some c <- queryContractId e.terms.av i.credential
-    Some a <- queryContractId e.terms.av (fromInterfaceContractId @TokenAllocation i.currentLock)
     now <- getTime
-    let exclusion = if a.d2SeizureHook /= None then Some "payment lock marked"
-                    else if c.revoked then Some "credential revoked"
+    let exclusion = if c.revoked then Some "credential revoked"
                     else if now >= c.validUntil then Some "credential expired" else None
-    pure (ClearEvidence accepted i.currentLock i.credential, Quote b.number b.bid.lots b.bid.maxPrice exclusion)
+    pure (ClearEvidence accepted i.currentLock i.currentReceipt i.credential, Quote b.number b.bid.lots b.bid.maxPrice exclusion)
   pure ClearInput with
-    bids = map fst bids; supply
+    bids = map fst bids; supply; proceeds = r.proceedsReceipt.root
     proposed = computeResult e.terms (map snd bids)
-    approval = None; cashArgs = extra; tokenArgs = extra
+    approval = None; cashArgs = cashContext e; tokenArgs = tokenContext e
 
 clearRound : Env -> ContractId Round -> ClearInput -> Script (ContractId ClearedRound)
-clearRound e round input = submit (actAs e.terms.ao <> readAs e.terms.av <> discloseMany e.disclosures) do
-  exerciseCmd (grant e Clearing) ClearRound with round; input
+clearRound e round input = do
+  e <- withRegistryDisclosures e
+  submit (actAs e.terms.ao <> readAs e.terms.av <> discloseMany e.disclosures) do
+    exerciseCmd (grant e Clearing) ClearRound with round; input
 
 -- Query the account's total, separating freely usable and locked holdings.
 balance : Party -> H.Account -> Text -> Bool -> Script Decimal
 balance owner account instrument locked = do
-  holdings <- query @TokenHolding owner
+  holdings <- query @Token owner
   pure (sum [h.holding.amount | (_, h) <- holdings, h.holding.account == account,
              h.holding.instrumentId.id == instrument, (h.holding.lock /= None) == locked])
 
@@ -221,3 +313,36 @@ awaitVisible : (Template t, HasEnsure t) => Party -> ContractId t -> Script ()
 awaitVisible party cid = do
   _ <- awaitValue (show cid) (queryContractId party cid)
   pure ()
+
+-- Simulate the registry context endpoint: the admin supplies disclosed locked
+-- holdings. This adds visibility to the command, never admin submission authority.
+withRegistryDisclosures : Env -> Script Env
+withRegistryDisclosures e = do
+  allocations <- query @TokenAllocationV2 e.terms.av
+  disclosures <- forA allocations $ \(_, a) ->
+    forA (concatMap snd (TM.toList a.lockedTokens)) $ \cid -> do
+      Some d <- queryDisclosure @Token a.allocation.admin (fromInterfaceContractId cid)
+      pure d
+  pure (e with disclosures = concat disclosures <> e.staticDisclosures)
+
+releaseTicket : Env -> ContractId RecoveryTicket -> AllocationId -> AllocationId -> Script [ContractId H.Holding]
+releaseTicket e ticket current receipt = do
+  e <- withRegistryDisclosures e
+  Some t <- queryContractId e.terms.av ticket
+  let cashFunding = t.lock.specification.admin == e.terms.cashAdmin
+  submit (actAs e.terms.ao <> readAs e.terms.av <> discloseMany e.disclosures) do
+    exerciseCmd (grant e Recovery) Release with
+      ticket; current; receipt
+      fundingArgs = if cashFunding then cashContext e else tokenContext e
+      receiptArgs = if cashFunding then tokenContext e else cashContext e
+
+assertSourceActive : Env -> BidSource -> Script ()
+assertSourceActive e source = case source of
+  FundedBid cid -> assertActive e.terms.av cid
+  RegistryPreparedBid cid -> assertActive e.terms.av cid
+
+-- Immediate allocations produce PreparedBid and support early abandonment.
+preparedId : AdmissionInput -> ContractId PreparedBid
+preparedId input = case input.prepared of
+  FundedBid cid -> cid
+  RegistryPreparedBid _ -> error "this input uses a registry-prepared bid"

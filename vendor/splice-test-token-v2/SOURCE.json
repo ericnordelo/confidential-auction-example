@@ -1,0 +1,36 @@
+{
+  "repository": "canton-network/splice",
+  "commit": "69b43eb761e38695052c983715aa855c8cb207fc",
+  "path": "token-standard/examples/splice-test-token-v2",
+  "license": "Apache-2.0",
+  "buildAdjustments": [
+    "SDK 3.5.2 to project SDK 3.4.11, retaining Daml-LF 2.1",
+    "Data dependency paths point to the existing pinned interface and utility DARs"
+  ],
+  "files": [
+    {
+      "file": "daml/Splice/Testing/Tokens/TestTokenV2.daml",
+      "gitBlobSha": "8dc40d5face727ea6374b2b766a0428a531de086"
+    },
+    {
+      "file": "daml/Splice/Testing/Tokens/TestTokenV2/Holding.daml",
+      "gitBlobSha": "bdabe59faf03b0700019d1b790161e3e26bbeebb"
+    },
+    {
+      "file": "daml/Splice/Testing/Tokens/TestTokenV2/Allocation.daml",
+      "gitBlobSha": "d64fc201268115cc0ad045418b27fd636754ffe1"
+    },
+    {
+      "file": "daml/Splice/Testing/Tokens/TestTokenV2/AccountConfig.daml",
+      "gitBlobSha": "7e6ce123c07ea01e11614852e3bdfbffd87f07c1"
+    },
+    {
+      "file": "daml/Splice/Testing/Tokens/TestTokenV2/Transfer.daml",
+      "gitBlobSha": "c875af5989702bd9b564583ec54afa8289baeee6"
+    },
+    {
+      "file": "daml/Splice/Testing/Tokens/TestTokenV2/Util.daml",
+      "gitBlobSha": "01f4c073d0c04a6fec736c5e08a583662b28a27f"
+    }
+  ]
+}

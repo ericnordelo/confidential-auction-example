@@ -7,7 +7,7 @@ dependencies:
   - daml-stdlib
   - daml-script
 data-dependencies:
-  - ../vendor/experiments/token/tokenCIP112-v1/.daml/dist/openzeppelin-tokenCIP112-v1-0.1.0.dar
+  - ../vendor/splice-test-token-v2/.daml/dist/splice-test-token-v2-1.0.0.dar
   - ../auction/.daml/dist/confidential-auction-poc-0.1.0.dar
   - ../vendor/dars/vendor/splice-api-token-allocation-instruction-v1-1.0.0.dar
   - ../vendor/dars/vendor/splice-api-token-allocation-instruction-v2-1.0.0.dar

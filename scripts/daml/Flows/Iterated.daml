@@ -1,0 +1,389 @@
+-- Execute V2 allocation funding and finalization against unchanged Splice code.
+module Flows.Iterated where
+
+import Daml.Script
+import DA.Assert ((===))
+import DA.Foldable (forA_)
+import DA.List (head, dedupSort)
+import DA.TextMap qualified as TM
+import DA.Time (addRelTime, hours)
+import Splice.Api.Token.HoldingV2 qualified as H
+import Splice.Api.Token.AllocationV2 qualified as A
+import Splice.Api.Token.AllocationInstructionV2 qualified as F
+import Splice.Api.Token.MetadataV1 (Metadata(..), emptyMetadata)
+import Splice.TokenStandard.Utils (toAnyContractId, senderSide, receiverSide)
+import Splice.Testing.Tokens.TestTokenV2
+import Auction.Assets
+import Auction.Types
+import Auction.Workflow
+import Auction.Eligibility
+import Flows.Support
+
+-- A wallet calls the real allocation factory. A custodied account can return
+-- Pending; admission requires completed payment and receipt allocations.
+requestRegistryAllocation : Env -> Bool -> [Party] -> A.SettlementInfo -> A.AllocationSpecification -> [ContractId H.Holding] -> Script F.AllocationInstructionResult
+requestRegistryAllocation e cash actors settlement allocation inputs = do
+  now <- getTime
+  -- Each registry request gets fresh input disclosures. Cached locked holdings
+  -- may have been consumed by a previous iteration and must not be reused.
+  disclosures <- forA inputs $ \cid -> do
+    Some d <- queryDisclosure @Token allocation.admin (fromInterfaceContractId cid)
+    pure d
+  submit (actAs actors <> discloseMany (disclosures <> e.staticDisclosures)) do
+    exerciseCmd (toInterfaceContractId @F.AllocationFactory (if cash then e.terms.cashRules else e.terms.tokenRules)) F.AllocationFactory_Allocate with
+      settlement; allocation; requestedAt = now; inputHoldingCids = inputs; actors
+      extraArgs = if cash then cashContext e else tokenContext e
+
+completed : F.AllocationInstructionResult -> AllocationId
+completed r = case r.output of
+  F.AllocationInstructionResult_Completed cid -> cid
+  _ -> error "expected a completed allocation"
+
+-- Inspect funding, receipt approval and the common reference before clear.
+-- After clear, all four original allocations are consumed without successors.
+preparedAllocationsAndRefunds : Script ()
+preparedAllocationsAndRefunds = do
+  e <- setup "prepared-allocations" False
+  let t = e.terms
+      b = bidTerms e e.alice 5 12.0
+  (round, published, supply) <- openRound e
+  Some r <- queryContractId t.av round
+  bid <- prepareBid e published b
+  Some cash <- queryContractId t.av (fromInterfaceContractId @TokenAllocationV2 bid.currentLock)
+  Some token <- queryContractId t.av (fromInterfaceContractId @TokenAllocationV2 bid.currentReceipt)
+  cash.allocation.nextIterationFunding === Some (TM.fromList [(t.cashInstrument, 600.0)])
+  token.allocation.nextIterationFunding === Some TM.empty
+  cash.allocation.transferLegSides === []
+  token.allocation.transferLegSides === []
+  token.lockedTokens === TM.empty
+  cash.settlement === settlementFor t r.roundId
+  token.settlement === cash.settlement
+  cash.settlement === r.supplyLock.settlement
+  token.settlement === r.proceedsReceipt.settlement
+  admitted <- acceptBatch e round supply [bid]
+  Some book <- queryContractId t.av admitted
+  Some accepted <- queryContractId t.av (head book.accepted)
+  assertMsg "provider authority leaked into accepted bid" (e.aliceProvider `notElem` signatory accepted)
+  closed <- closeRound e admitted
+  input <- clearInput e closed supply [bid]
+  _ <- clearRound e closed input
+  -- Fifty tokens sell at reserve 8. The locked 600 pays 400 and refunds 200.
+  balance e.alice b.payment t.cashInstrument False >>= (=== 200.0)
+  balance e.alice b.delivery t.tokenInstrument False >>= (=== 50.0)
+  balance t.issuer t.inventory t.tokenInstrument False >>= (=== 50.0)
+  balance t.issuer t.proceeds t.cashInstrument False >>= (=== 400.0)
+  forA_ [bid.currentLock, bid.currentReceipt, supply, r.proceedsReceipt.root] $ \cid ->
+    assertGone t.av (fromInterfaceContractId @TokenAllocationV2 cid)
+  query @TokenAllocationV2 t.av >>= (\xs -> length xs === 0)
+
+-- A later invalid receipt rejects the whole acceptance batch, including the
+-- first valid bid. Cancelling receipt approval after acceptance blocks clear.
+receiptGuards : Script ()
+receiptGuards = do
+  e <- setup "receipt-guards" False
+  (round, published, supply) <- openRound e
+  Some r <- queryContractId e.terms.av round
+  alice <- prepareBid e published (bidTerms e e.alice 5 12.0)
+  bob <- prepareBid e published (bidTerms e e.bob 8 10.0)
+  submitMustFail (actAs e.terms.ao <> readAs e.terms.av) do
+    exerciseCmd (grant e Admission) AcceptBatch with
+      round; supply; receipt = r.proceedsReceipt.root
+      bids = [alice, bob with currentReceipt = alice.currentReceipt]
+  assertActive e.terms.av round
+  assertSourceActive e alice.prepared
+  assertSourceActive e bob.prepared
+  admitted <- acceptBatch e round supply [alice,bob]
+  _ <- submit (actAs e.terms.av <> discloseMany e.disclosures) do
+    exerciseCmd alice.currentReceipt A.Allocation_Cancel with actors = [e.terms.av]; extraArgs = tokenContext e
+  closed <- closeRound e admitted
+  input <- clearInput e closed supply [alice,bob]
+  submitMustFail (actAs e.terms.ao <> readAs e.terms.av <> discloseMany e.disclosures) do
+    exerciseCmd (grant e Clearing) ClearRound with round = closed; input
+  assertActive e.terms.av closed
+  balance e.terms.issuer e.terms.proceeds e.terms.cashInstrument False >>= (=== 0.0)
+
+-- One Alice submission creates both pending instructions and the signed bid.
+-- Providers approve only registry contracts. Each incomplete side blocks admission.
+custodianApproval : Script ()
+custodianApproval = do
+  e <- setup "custody" False
+  let t = e.terms
+      b = bidTerms e e.alice 5 12.0
+  (round, published, supply) <- openRound e
+  Some r <- queryContractId t.av round
+  (holding, _) <- mint e True b.payment 600.0
+  source@(RegistryPreparedBid request) <- submitBid e published b [holding]
+  Some pending <- queryContractId t.av request
+  dedupSort (signatory pending) === dedupSort [t.av, e.alice]
+  F.AllocationInstructionResult_Pending payment <- pure pending.payment
+  F.AllocationInstructionResult_Pending receiving <- pure pending.receipt
+  Some paymentDisclosure <- queryDisclosure @TokenAllocationInstructionV2 t.cashAdmin (fromInterfaceContractId payment)
+  Some receiptDisclosure <- queryDisclosure @TokenAllocationInstructionV2 t.tokenAdmin (fromInterfaceContractId receiving)
+  credential <- submit t.eligibilityProvider do
+    createCmd $ Credential t.eligibilityProvider e.alice t.av None (addRelTime e.start (hours 1)) False
+  let pendingBid = AdmissionInput source (coerceContractId payment) (coerceContractId receiving) credential
+  submitMustFail (actAs t.ao <> readAs t.av <> discloseMany [paymentDisclosure,receiptDisclosure]) do
+    exerciseCmd (grant e Admission) AcceptBatch with round; supply; receipt = r.proceedsReceipt.root; bids = [pendingBid]
+  balance e.alice b.payment t.cashInstrument True >>= (=== 0.0)
+  balance e.alice b.payment t.cashInstrument False >>= (=== 600.0)
+
+  currentLock <- completeAllocation e True pending.payment
+  -- Funding alone is insufficient: token receipt approval is still pending.
+  submitMustFail (actAs t.ao <> readAs t.av <> discloseMany [receiptDisclosure]) do
+    exerciseCmd (grant e Admission) AcceptBatch with
+      round; supply; receipt = r.proceedsReceipt.root; bids = [pendingBid with currentLock]
+  assertActive t.av request
+  balance e.alice b.payment t.cashInstrument True >>= (=== 600.0)
+  receipt <- completeAllocation e False pending.receipt
+  let bid = AdmissionInput source currentLock receipt credential
+  admitted <- acceptBatch e round supply [bid]
+  assertGone t.av request
+  closed <- closeRound e admitted
+  input <- clearInput e closed supply [bid]
+  _ <- clearRound e closed input
+  balance e.alice b.delivery t.tokenInstrument False >>= (=== 50.0)
+  balance e.alice b.payment t.cashInstrument False >>= (=== 200.0)
+  assertGone t.cashAdmin (fromInterfaceContractId @TokenAllocationInstructionV2 payment)
+  assertGone t.tokenAdmin (fromInterfaceContractId @TokenAllocationInstructionV2 receiving)
+
+-- Different registries can return different readiness states in the same bid.
+-- Alice's basic delivery account completes while her payment needs custody consent.
+mixedReadiness : Script ()
+mixedReadiness = do
+  e <- setup "mixed-readiness" False
+  let t = e.terms
+      original = bidTerms e e.alice 5 12.0
+      b = original with delivery = original.delivery with provider = None
+  (round, published, supply) <- openRound e
+  (holding, _) <- mint e True b.payment 600.0
+  source@(RegistryPreparedBid request) <- submitBid e published b [holding]
+  Some pending <- queryContractId t.av request
+  F.AllocationInstructionResult_Pending _ <- pure pending.payment
+  F.AllocationInstructionResult_Completed receipt <- pure pending.receipt
+  assertActive t.av (fromInterfaceContractId @TokenAllocationV2 receipt)
+  currentLock <- completeAllocation e True pending.payment
+  credential <- issueCredential e e.alice
+  let bid = AdmissionInput source currentLock receipt credential
+  admitted <- acceptBatch e round supply [bid]
+  closed <- closeRound e admitted
+  input <- clearInput e closed supply [bid]
+  _ <- clearRound e closed input
+  balance e.alice b.delivery t.tokenInstrument False >>= (=== 50.0)
+  balance e.alice b.payment t.cashInstrument False >>= (=== 200.0)
+
+-- This registry-only scenario distinguishes the initial reservation from the
+-- funding kept AFTER a settlement. The auction itself always finalizes with None.
+fundingRollover : Script ()
+fundingRollover = do
+  e <- setup "rollover" False
+  let t = e.terms
+      sender = H.Account (Some e.bob) None "funding"
+      receiver = H.Account (Some e.carol) None "receipt"
+      settlement = settlementFor t (toAnyContractId t.cashRules)
+      senderSpec = mkSpec t.cashAdmin sender t.settlementDeadline (TM.fromList [(t.cashInstrument,600.0)])
+      receiverSpec = mkSpec t.cashAdmin receiver t.settlementDeadline TM.empty
+      leg = A.TransferLeg "first" sender receiver 200.0 t.cashInstrument emptyMetadata
+  (holding, disclosure) <- mint e True sender 600.0
+  sent <- requestRegistryAllocation (e with disclosures = disclosure :: e.disclosures) True [e.bob] settlement senderSpec [holding]
+  received <- requestRegistryAllocation e True [e.carol] settlement receiverSpec []
+  e <- withRegistryDisclosures e
+  let senderCid = completed sent
+      receiverCid = completed received
+      batch funding = A.SettlementFactory_SettleBatch settlement [leg]
+        [A.FinalizedAllocation senderCid [senderSide leg] funding, finalize receiverCid [receiverSide leg]] [t.av] (cashContext e)
+  -- Spending 200 leaves 400, so reserving 500 must reject the whole batch.
+  submitMustFail (actAs t.av <> discloseMany e.disclosures) do
+    exerciseCmd (toInterfaceContractId @A.SettlementFactory t.cashRules) (batch (Some (TM.fromList [(t.cashInstrument,500.0)])))
+  assertActive t.av (fromInterfaceContractId @TokenAllocationV2 senderCid)
+  result <- submit (actAs t.av <> discloseMany e.disclosures) do
+    exerciseCmd (toInterfaceContractId @A.SettlementFactory t.cashRules) (batch (Some (TM.fromList [(t.cashInstrument,300.0)])))
+  A.AllocationResult_Settled (Some successor) <- pure (head result.allocationSettleResults).output
+  Some next <- queryContractId t.av (fromInterfaceContractId @TokenAllocationV2 successor)
+  next.originalAllocationCid === Some senderCid
+  next.numIterations === 1
+  next.allocation.nextIterationFunding === Some (TM.fromList [(t.cashInstrument,300.0)])
+  balance e.bob sender t.cashInstrument True >>= (=== 300.0)
+  balance e.bob sender t.cashInstrument False >>= (=== 100.0)
+  balance e.carol receiver t.cashInstrument False >>= (=== 200.0)
+  secondReceipt <- requestRegistryAllocation e True [e.carol] settlement receiverSpec []
+  let second = leg with transferLegId = "second"; amount = 150.0
+  e <- withRegistryDisclosures e
+  final <- submit (actAs t.av <> discloseMany e.disclosures) do
+    exerciseCmd (toInterfaceContractId @A.SettlementFactory t.cashRules) A.SettlementFactory_SettleBatch with
+      settlement; transferLegs = [second]
+      allocations = [finalize successor [senderSide second], finalize (completed secondReceipt) [receiverSide second]]
+      actors = [t.av]; extraArgs = cashContext e
+  map (.output) final.allocationSettleResults === [A.AllocationResult_Settled None, A.AllocationResult_Settled None]
+  balance e.bob sender t.cashInstrument True >>= (=== 0.0)
+  balance e.bob sender t.cashInstrument False >>= (=== 250.0)
+  balance e.carol receiver t.cashInstrument False >>= (=== 350.0)
+  assertGone t.av (fromInterfaceContractId @TokenAllocationV2 successor)
+
+-- Funding reuse fails within a batch and across batches, including after
+-- custody replaces an allocation's CID. Independent funding admits identical bids.
+allocationReuseGuard : Script ()
+allocationReuseGuard = do
+  e <- setup "reuse" False
+  let t = e.terms
+      b = bidTerms e e.alice 5 12.0
+  (round, published, supply) <- openRound e
+  Some initial <- queryContractId t.av round
+  bid <- prepareBid e published b
+  (aliasHolding, _) <- mint e True b.payment 600.0
+  source@(RegistryPreparedBid alias) <- submitBid e published b [aliasHolding]
+  let reused = bid with prepared = source
+      attempt round candidate = submitMustFail (actAs t.ao <> readAs t.av) do
+        exerciseCmd (grant e Admission) AcceptBatch with
+          round; supply; receipt = initial.proceedsReceipt.root; bids = [candidate]
+  submitMustFail (actAs t.ao <> readAs t.av) do
+    exerciseCmd (grant e Admission) AcceptBatch with
+      round; supply; receipt = initial.proceedsReceipt.root; bids = [bid,reused]
+  assertSourceActive e bid.prepared
+  assertActive t.av alias
+  admitted <- acceptBatch e round supply [bid]
+  attempt admitted reused
+  pending <- submit (actAs e.alice <> discloseMany e.disclosures) do
+    exerciseCmd bid.currentLock A.Allocation_Withdraw with actors = [e.alice]; extraArgs = cashContext e
+  A.AllocationResult_Pending successor <- pure pending.output
+  pendingReceipt <- submit (actAs e.alice <> discloseMany e.disclosures) do
+    exerciseCmd bid.currentReceipt A.Allocation_Withdraw with actors = [e.alice]; extraArgs = tokenContext e
+  A.AllocationResult_Pending receiptSuccessor <- pure pendingReceipt.output
+  let currentBid = bid with currentLock = successor; currentReceipt = receiptSuccessor
+  -- Both CIDs change, so only their original identities detect this reuse.
+  forA_ [(bid.currentLock, successor, cashContext e), (bid.currentReceipt, receiptSuccessor, tokenContext e)] $ \(original, current, args) -> do
+    Some allocation <- queryContractId t.av (fromInterfaceContractId @TokenAllocationV2 current)
+    allocation.originalAllocationCid === Some original
+    allocation.numIterations === 0
+    assertGone t.av (fromInterfaceContractId @TokenAllocationV2 original)
+    -- The owner cannot repeat approval to create another pending successor.
+    submitMustFail (actAs e.alice <> discloseMany e.disclosures) do
+      exerciseCmd current A.Allocation_Withdraw with actors = [e.alice]; extraArgs = args
+    -- Completing custody approval cannot release committed funds early.
+    submitMustFail (actAs e.aliceProvider <> discloseMany e.disclosures) do
+      exerciseCmd current A.Allocation_Withdraw with actors = [e.aliceProvider]; extraArgs = args
+  attempt admitted (reused with currentLock = successor; currentReceipt = receiptSuccessor)
+  -- A distinct, genuinely funded pair admits the identical second bid.
+  (payment, receipt) <- completeBid e source
+  let other = AdmissionInput source payment receipt bid.credential
+  -- Reusing either side independently also fails.
+  attempt admitted (other with currentLock = successor)
+  attempt admitted (other with currentReceipt = receiptSuccessor)
+  admitted <- acceptBatch e admitted supply [other]
+  closed <- closeRound e admitted
+  swapped <- clearInput e closed supply [other, currentBid]
+  submitMustFail (actAs t.ao <> readAs t.av <> discloseMany e.disclosures) do
+    exerciseCmd (grant e Clearing) ClearRound with round = closed; input = swapped
+  input <- clearInput e closed supply [currentBid,other]
+  _ <- clearRound e closed input
+  balance e.alice b.delivery t.tokenInstrument False >>= (=== 100.0)
+  balance e.alice b.payment t.cashInstrument False >>= (=== 400.0)
+
+-- Identical parties, terms and textual settlement labels do not make an
+-- allocation from another round valid. The contract-ID reference must match.
+roundReferenceGuard : Script ()
+roundReferenceGuard = do
+  e <- setup "round-reference" False
+  let t = e.terms
+      b = bidTerms e e.alice 5 12.0
+  (_, published1, _) <- openRound e
+  bid <- prepareBid e published1 b
+  (round2, published2, supply2) <- openRound e
+  Some r <- queryContractId t.av round2
+  (holding, _) <- mint e True b.payment 600.0
+  RegistryPreparedBid request <- submitBid e published2 b [holding]
+  let wrongRound = bid with prepared = RegistryPreparedBid request
+  submitMustFail (actAs t.ao <> readAs t.av) do
+    exerciseCmd (grant e Admission) AcceptBatch with
+      round = round2; supply = supply2; receipt = r.proceedsReceipt.root; bids = [wrongRound]
+  assertActive t.av round2
+  assertActive t.av request
+  assertSourceActive e bid.prepared
+
+-- None at creation permits only the original exact sides. None at finalization
+-- of an iterated allocation ends its lifecycle after executor-specified sides.
+nonIteratedCannotAddSides : Script ()
+nonIteratedCannotAddSides = do
+  e <- setup "non-iterated" False
+  let t = e.terms
+      sender = H.Account (Some e.bob) None "fixed-payment"
+      receiver = H.Account (Some e.carol) None "fixed-receipt"
+      settlement = settlementFor t (toAnyContractId t.cashRules)
+      leg = A.TransferLeg "fixed" sender receiver 100.0 t.cashInstrument emptyMetadata
+      senderSpec = A.AllocationSpecification t.cashAdmin sender [senderSide leg] (Some t.settlementDeadline) None True emptyMetadata
+      receiverSpec = mkSpec t.cashAdmin receiver t.settlementDeadline TM.empty
+  (holding, disclosure) <- mint e True sender 100.0
+  sent <- requestRegistryAllocation (e with disclosures = disclosure :: e.disclosures) True [e.bob] settlement senderSpec [holding]
+  received <- requestRegistryAllocation e True [e.carol] settlement receiverSpec []
+  e <- withRegistryDisclosures e
+  let senderCid = completed sent
+      receiverCid = completed received
+      batch senderSides = A.SettlementFactory_SettleBatch settlement [leg]
+        [finalize senderCid senderSides, finalize receiverCid [receiverSide leg]] [t.av] (cashContext e)
+  submitMustFail (actAs t.av <> discloseMany e.disclosures) do
+    exerciseCmd (toInterfaceContractId @A.SettlementFactory t.cashRules) (batch [senderSide leg])
+  _ <- submit (actAs t.av <> discloseMany e.disclosures) do
+    exerciseCmd (toInterfaceContractId @A.SettlementFactory t.cashRules) (batch [])
+  balance e.carol receiver t.cashInstrument False >>= (=== 100.0)
+
+-- A partial custody withdrawal changes the allocation CID without releasing
+-- committed funding. Clear must reject the stale CID and use the active successor.
+committedWithdrawalSuccessor : Script ()
+committedWithdrawalSuccessor = do
+  e <- setup "withdraw-successor" False
+  let t = e.terms
+      b = bidTerms e e.alice 5 12.0
+  (round, published, supply) <- openRound e
+  bid <- prepareBid e published b
+  admitted <- acceptBatch e round supply [bid]
+  pending <- submit (actAs e.alice <> discloseMany e.disclosures) do
+    exerciseCmd bid.currentLock A.Allocation_Withdraw with actors = [e.alice]; extraArgs = cashContext e
+  A.AllocationResult_Pending successor <- pure pending.output
+  Some a <- queryContractId t.av (fromInterfaceContractId @TokenAllocationV2 successor)
+  a.originalAllocationCid === Some bid.currentLock
+  a.numIterations === 0
+  -- The provider cannot finish withdrawal before the committed deadline.
+  submitMustFail (actAs e.aliceProvider <> discloseMany e.disclosures) do
+    exerciseCmd successor A.Allocation_Withdraw with actors = [e.aliceProvider]; extraArgs = cashContext e
+  closed <- closeRound e admitted
+  stale <- clearInput e closed supply [bid]
+  submitMustFail (actAs t.ao <> readAs t.av <> discloseMany e.disclosures) do
+    exerciseCmd (grant e Clearing) ClearRound with round = closed; input = stale
+  current <- clearInput e closed supply [bid with currentLock = successor]
+  _ <- clearRound e closed current
+  balance e.alice b.delivery t.tokenInstrument False >>= (=== 50.0)
+  balance e.alice b.payment t.cashInstrument False >>= (=== 200.0)
+
+-- Check the whole SettlementInfo, including its metadata and executors.
+-- Each rejected allocation is real, funded and has the correct specification.
+settlementInfoGuards : Script ()
+settlementInfoGuards = do
+  e <- setup "settlement-info" False
+  let t = e.terms
+      b = bidTerms e e.alice 5 12.0
+  (round, published, supply) <- openRound e
+  Some r <- queryContractId t.av round
+  bid <- prepareBid e published b
+  RegistryPreparedBid request <- pure bid.prepared
+  let expected = settlementFor t r.roundId
+      specification = mkSpec t.cashAdmin b.payment t.settlementDeadline
+        (TM.fromList [(t.cashInstrument,600.0)])
+      wrongReferences =
+        [ expected with id = "other-settlement"
+        , expected with cid = Some (toAnyContractId t.cashRules)
+        , expected with meta = Metadata (TM.singleton "other" "settlement")
+        , expected with executors = [t.av,e.outsider]
+        ]
+  forA_ wrongReferences $ \settlement -> do
+    (holding, _) <- mint e True b.payment 600.0
+    allocation <- requestRegistryAllocation e True [e.alice,e.aliceProvider] settlement specification [holding]
+    submitMustFail (actAs t.ao <> readAs t.av) do
+      exerciseCmd (grant e Admission) AcceptBatch with
+        round; supply; receipt = r.proceedsReceipt.root
+        bids = [bid with currentLock = completed allocation]
+    assertActive t.av request
+    assertActive t.av round
+  admitted <- acceptBatch e round supply [bid]
+  Some acceptedRound <- queryContractId t.av admitted
+  Some accepted <- queryContractId t.av (head acceptedRound.accepted)
+  accepted.lock.settlement === expected
+

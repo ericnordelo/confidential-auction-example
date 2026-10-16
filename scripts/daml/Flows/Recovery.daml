@@ -6,9 +6,116 @@ import DA.Foldable (forA_)
 import DA.List (head)
 import DA.Time (addRelTime, seconds)
 import Splice.Api.Token.AllocationV2 qualified as A
-import Auction.Assets
+import Splice.Api.Token.AllocationInstructionV2 qualified as F
+import Splice.Testing.Tokens.TestTokenV2 (TokenAllocationV2)
 import Auction.Workflow
 import Flows.Support
+
+-- Abandoning an entirely pending round request leaves cleanup in the registries.
+-- The issuer withdraws both instructions without provider or operator submission.
+pendingRoundFundingWithdrawal : Script ()
+pendingRoundFundingWithdrawal = do
+  e <- setup "pending-round-withdrawal" False
+  let t = e.terms
+  preparation <- submit (actAs t.ao <> readAs t.av) do
+    exerciseCmd (grant e Preparation) StartRound with terms = t
+  (holding,_) <- mint e False t.inventory 100.0
+  RegistryPreparedRound request <- submitRoundFunding e preparation [holding]
+  Some pending <- queryContractId t.av request
+  F.AllocationInstructionResult_Pending inventory <- pure pending.inventory
+  F.AllocationInstructionResult_Pending receipt <- pure pending.receipt
+  submit t.issuer do exerciseCmd request AbandonRoundFunding
+  forA_ [(inventory,tokenContext e),(receipt,cashContext e)] $ \(instruction,args) -> do
+    result <- submit (actAs t.issuer <> discloseMany e.staticDisclosures) do
+      exerciseCmd instruction F.AllocationInstruction_Withdraw with actors = [t.issuer]; extraArgs = args
+    result.output === F.AllocationInstructionResult_Failed
+  assertGone t.av request
+  query @RecoveryTicket t.av >>= (\xs -> length xs === 0)
+  query @Round t.av >>= (\xs -> length xs === 0)
+  balance t.issuer t.inventory t.tokenInstrument False >>= (=== 100.0)
+  balance t.issuer t.inventory t.tokenInstrument True >>= (=== 0.0)
+
+-- A completed inventory allocation remains committed after request abandonment.
+-- Registry withdrawal releases it at the deadline, with no auction recovery ticket.
+mixedRoundFundingWithdrawal : Script ()
+mixedRoundFundingWithdrawal = do
+  initial <- setup "mixed-round-withdrawal" False
+  let e = initial with terms = initial.terms with inventory = initial.terms.inventory with provider = None
+      t = e.terms
+  preparation <- submit (actAs t.ao <> readAs t.av) do
+    exerciseCmd (grant e Preparation) StartRound with terms = t
+  (holding,_) <- mint e False t.inventory 100.0
+  RegistryPreparedRound request <- submitRoundFunding e preparation [holding]
+  Some pending <- queryContractId t.av request
+  F.AllocationInstructionResult_Completed supply <- pure pending.inventory
+  F.AllocationInstructionResult_Pending receipt <- pure pending.receipt
+  submit t.issuer do exerciseCmd request AbandonRoundFunding
+  _ <- submit (actAs t.issuer <> discloseMany e.staticDisclosures) do
+    exerciseCmd receipt F.AllocationInstruction_Withdraw with actors = [t.issuer]; extraArgs = cashContext e
+  e <- withRegistryDisclosures e
+  submitMustFail (actAs t.issuer <> discloseMany e.disclosures) do
+    exerciseCmd supply A.Allocation_Withdraw with actors = [t.issuer]; extraArgs = tokenContext e
+  balance t.issuer t.inventory t.tokenInstrument True >>= (=== 100.0)
+  setTime (addRelTime t.settlementDeadline (seconds 1))
+  result <- submit (actAs t.issuer <> discloseMany e.disclosures) do
+    exerciseCmd supply A.Allocation_Withdraw with actors = [t.issuer]; extraArgs = tokenContext e
+  result.output === A.AllocationResult_Withdrawn
+  balance t.issuer t.inventory t.tokenInstrument False >>= (=== 100.0)
+  assertGone t.av (fromInterfaceContractId @TokenAllocationV2 supply)
+  query @RecoveryTicket t.av >>= (\xs -> length xs === 0)
+
+-- If receipt completes first, abandonment still creates no auction recovery
+-- ticket. Withdraw the payment instruction and later the committed receipt.
+mixedBidWithdrawal : Script ()
+mixedBidWithdrawal = do
+  e <- setup "mixed-withdrawal" False
+  let t = e.terms
+      original = bidTerms e e.alice 5 12.0
+      b = original with delivery = original.delivery with provider = None
+  (_, published, _) <- openRound e
+  (holding, _) <- mint e True b.payment 600.0
+  RegistryPreparedBid request <- submitBid e published b [holding]
+  Some pending <- queryContractId t.av request
+  F.AllocationInstructionResult_Pending payment <- pure pending.payment
+  F.AllocationInstructionResult_Completed receipt <- pure pending.receipt
+  submit e.alice do exerciseCmd request AbandonBidRequest
+  withdrawn <- submit (actAs e.alice <> discloseMany e.staticDisclosures) do
+    exerciseCmd payment F.AllocationInstruction_Withdraw with actors = [e.alice]; extraArgs = cashContext e
+  withdrawn.output === F.AllocationInstructionResult_Failed
+  -- Even unfunded receipt consent is committed until the registry deadline.
+  submitMustFail (actAs e.alice <> discloseMany e.staticDisclosures) do
+    exerciseCmd receipt A.Allocation_Withdraw with actors = [e.alice]; extraArgs = tokenContext e
+  assertActive t.av (fromInterfaceContractId @TokenAllocationV2 receipt)
+  setTime (addRelTime t.settlementDeadline (seconds 1))
+  result <- submit (actAs e.alice <> discloseMany e.staticDisclosures) do
+    exerciseCmd receipt A.Allocation_Withdraw with actors = [e.alice]; extraArgs = tokenContext e
+  result.output === A.AllocationResult_Withdrawn
+  assertGone t.av (fromInterfaceContractId @TokenAllocationV2 receipt)
+  query @RecoveryTicket t.av >>= (\xs -> length xs === 0)
+  balance e.alice b.payment t.cashInstrument False >>= (=== 600.0)
+
+-- Abandoning a pending bid consumes only its auction request. Alice withdraws
+-- each registry instruction herself, without operator or provider submission.
+pendingBidWithdrawal : Script ()
+pendingBidWithdrawal = do
+  e <- setup "pending-withdrawal" False
+  let t = e.terms
+      b = bidTerms e e.alice 5 12.0
+  (_, published, _) <- openRound e
+  (holding, _) <- mint e True b.payment 600.0
+  RegistryPreparedBid request <- submitBid e published b [holding]
+  Some pending <- queryContractId t.av request
+  F.AllocationInstructionResult_Pending payment <- pure pending.payment
+  F.AllocationInstructionResult_Pending receipt <- pure pending.receipt
+  submit e.alice do exerciseCmd request AbandonBidRequest
+  forA_ [(payment,cashContext e),(receipt,tokenContext e)] $ \(instruction,args) -> do
+    result <- submit (actAs e.alice <> discloseMany e.staticDisclosures) do
+      exerciseCmd instruction F.AllocationInstruction_Withdraw with actors = [e.alice]; extraArgs = args
+    result.output === F.AllocationInstructionResult_Failed
+  assertGone t.av request
+  query @RecoveryTicket t.av >>= (\xs -> length xs === 0)
+  balance e.alice b.payment t.cashInstrument False >>= (=== 600.0)
+  balance e.alice b.payment t.cashInstrument True >>= (=== 0.0)
 
 -- A funded bid can miss admission. Being prepared before the cutoff is not
 -- enough: acceptance itself must validate at a ledger time before the cutoff.
@@ -16,18 +123,20 @@ lateBid : Script ()
 lateBid = do
   e <- setup "late" False
   (round, published, supply) <- openRound e
-  let bid = bidTerms e e.alice 5 12.0
+  Some initialRound <- queryContractId e.terms.av round
+  let receipt = initialRound.proceedsReceipt.root
+  let bid = bidTerms e e.bob 5 12.0
   prepared <- prepareBid e published bid
   setTime e.terms.biddingDeadline
   submitMustFail (actAs e.terms.ao <> readAs e.terms.av) do
-    exerciseCmd (grant e Admission) AcceptBatch with round; supply; bids = [prepared]
-  assertActive e.terms.av prepared.prepared
+    exerciseCmd (grant e Admission) AcceptBatch with round; supply; receipt; bids = [prepared]
+  assertSourceActive e prepared.prepared
 
   -- The bidder abandons its unaccepted bid. ao can then cancel that exact lock.
-  ticket <- submit e.alice do exerciseCmd prepared.prepared WithdrawPreparedBid
-  _ <- submit (actAs e.terms.ao <> readAs e.terms.av) do exerciseCmd (grant e Recovery) Release with ticket; current = prepared.currentLock
-  balance e.alice bid.payment e.terms.cashInstrument False >>= (=== 600.0)
-  submitMustFail (actAs e.terms.ao <> readAs e.terms.av) do exerciseCmd (grant e Recovery) Release with ticket; current = prepared.currentLock
+  ticket <- submit e.bob do exerciseCmd (preparedId prepared) WithdrawPreparedBid
+  _ <- releaseTicket e ticket prepared.currentLock prepared.currentReceipt
+  balance e.bob bid.payment e.terms.cashInstrument False >>= (=== 600.0)
+  submitMustFail (actAs e.terms.ao <> readAs e.terms.av <> discloseMany e.disclosures) do exerciseCmd (grant e Recovery) Release with ticket; current = prepared.currentLock; receipt = prepared.currentReceipt; fundingArgs = cashContext e; receiptArgs = tokenContext e
 
 -- A clear at the settlement deadline is rejected. Ending the round does not
 -- fetch every bid or unlock every account in one transaction.
@@ -35,6 +144,8 @@ missedSettlement : Script ()
 missedSettlement = do
   e <- setup "expiry" False
   (r0, published, supply) <- openRound e
+  Some initialRound <- queryContractId e.terms.av r0
+  let receipt = initialRound.proceedsReceipt.root
   alice <- prepareBid e published (bidTerms e e.alice 5 12.0)
   bob <- prepareBid e published (bidTerms e e.bob 8 10.0)
   r1 <- acceptBatch e r0 supply [alice,bob]
@@ -52,10 +163,10 @@ missedSettlement = do
     outcome <- submit (actAs e.terms.ao <> readAs e.terms.av) do exerciseCmd (grant e Recovery) CloseUnsettledBid with ended; bid
     Some o <- queryContractId e.terms.av outcome
     Some ticket <- pure o.recovery
-    _ <- submit (actAs e.terms.ao <> readAs e.terms.av) do exerciseCmd (grant e Recovery) Release with ticket; current = prepared.currentLock
+    _ <- releaseTicket e ticket prepared.currentLock prepared.currentReceipt
     pure ()
   supplyTicket <- submit (actAs e.terms.ao <> readAs e.terms.av) do exerciseCmd (grant e Recovery) CloseUnsettledSupply with ended
-  _ <- submit (actAs e.terms.ao <> readAs e.terms.av) do exerciseCmd (grant e Recovery) Release with ticket = supplyTicket; current = supply
+  _ <- releaseTicket e supplyTicket supply receipt
   balance e.alice (bidTerms e e.alice 5 12.0).payment e.terms.cashInstrument False >>= (=== 600.0)
   balance e.bob (bidTerms e e.bob 8 10.0).payment e.terms.cashInstrument False >>= (=== 800.0)
   balance e.terms.issuer e.terms.inventory e.terms.tokenInstrument False >>= (=== 100.0)
@@ -67,18 +178,20 @@ accountWithdrawal = do
   e <- setup "withdraw" False
   (_, published, _) <- openRound e
   bid <- prepareBid e published (bidTerms e e.alice 5 12.0)
-  let withdraw = A.Allocation_Withdraw [e.alice, e.aliceProvider] extra
-  submitMustFail [e.alice, e.aliceProvider] do exerciseCmd bid.currentLock withdraw
+  let withdraw = A.Allocation_Withdraw [e.alice, e.aliceProvider] (cashContext e)
+  submitMustFail (actAs [e.alice, e.aliceProvider] <> discloseMany e.disclosures) do exerciseCmd bid.currentLock withdraw
   setTime (addRelTime e.terms.settlementDeadline (seconds 1))
-  _ <- submit [e.alice, e.aliceProvider] do exerciseCmd bid.currentLock withdraw
+  _ <- submit (actAs [e.alice, e.aliceProvider] <> discloseMany e.disclosures) do exerciseCmd bid.currentLock withdraw
   balance e.alice (bidTerms e e.alice 5 12.0).payment e.terms.cashInstrument False >>= (=== 600.0)
 
 -- A losing bid is finalized without cancelling its allocation in the clear.
--- An unmarked zero-fill lock can then be released immediately, before expiry.
+-- Recovery cancels both its funding and unfunded receipt approval before expiry.
 zeroFill : Script ()
 zeroFill = do
   e <- setup "zero" False
   (r0, published, supply) <- openRound e
+  Some initialRound <- queryContractId e.terms.av r0
+  let receipt = initialRound.proceedsReceipt.root
   winner <- prepareBid e published (bidTerms e e.alice 10 12.0)
   loser <- prepareBid e published (bidTerms e e.bob 5 8.0)
   r1 <- acceptBatch e r0 supply [winner,loser]
@@ -90,5 +203,75 @@ zeroFill = do
   outcome.fill.lots === 0
   balance e.bob (bidTerms e e.bob 5 8.0).payment e.terms.cashInstrument True >>= (=== 400.0)
   Some ticket <- pure outcome.recovery
-  _ <- submit (actAs e.terms.ao <> readAs e.terms.av) do exerciseCmd (grant e Recovery) Release with ticket; current = loser.currentLock
+  _ <- releaseTicket e ticket loser.currentLock loser.currentReceipt
+  assertGone e.terms.av (fromInterfaceContractId @TokenAllocationV2 loser.currentLock)
+  assertGone e.terms.av (fromInterfaceContractId @TokenAllocationV2 loser.currentReceipt)
   balance e.bob (bidTerms e e.bob 5 8.0).payment e.terms.cashInstrument False >>= (=== 400.0)
+
+-- A ticket for an abandoned bid cannot cancel an identical accepted bid, even
+-- in the same round. Nor can it cancel matching accounts in another round.
+recoveryIsolation : Script ()
+recoveryIsolation = do
+  e <- setup "recovery-isolation" False
+  let t = e.terms
+      b = bidTerms e e.bob 5 12.0
+  (round, published, supply) <- openRound e
+  accepted <- prepareBid e published b
+  admitted <- acceptBatch e round supply [accepted]
+  abandoned <- prepareBid e published b
+  (_, otherTerms, _) <- openRound e
+  foreign <- prepareBid e otherTerms b
+  ticket <- submit e.bob do exerciseCmd (preparedId abandoned) WithdrawPreparedBid
+  e <- withRegistryDisclosures e
+  forA_ [(accepted.currentLock,accepted.currentReceipt),
+         (accepted.currentLock,abandoned.currentReceipt),
+         (abandoned.currentLock,accepted.currentReceipt),
+         (foreign.currentLock,foreign.currentReceipt)] $ \(current,receipt) -> do
+    submitMustFail (actAs t.ao <> readAs t.av <> discloseMany e.disclosures) do
+      exerciseCmd (grant e Recovery) Release with
+        ticket; current; receipt; fundingArgs = cashContext e; receiptArgs = tokenContext e
+    assertActive t.av ticket
+    assertActive t.av (fromInterfaceContractId @TokenAllocationV2 abandoned.currentLock)
+    assertActive t.av (fromInterfaceContractId @TokenAllocationV2 abandoned.currentReceipt)
+  _ <- releaseTicket e ticket abandoned.currentLock abandoned.currentReceipt
+  closed <- closeRound e admitted
+  input <- clearInput e closed supply [accepted]
+  _ <- clearRound e closed input
+  balance e.bob b.delivery t.tokenInstrument False >>= (=== 50.0)
+  balance e.bob b.payment t.cashInstrument False >>= (=== 800.0)
+
+-- Registry updates can change both IDs after a zero-fill ticket is created.
+-- Recovery checks their bound allocation terms, then cancels once.
+custodyRecoverySuccessor : Script ()
+custodyRecoverySuccessor = do
+  e <- setup "recovery-successor" False
+  let t = e.terms
+      losingTerms = bidTerms e e.alice 5 8.0
+  (round, published, supply) <- openRound e
+  winner <- prepareBid e published (bidTerms e e.bob 10 12.0)
+  loser <- prepareBid e published losingTerms
+  admitted <- acceptBatch e round supply [winner,loser]
+  closed <- closeRound e admitted
+  input <- clearInput e closed supply [winner,loser]
+  _ <- clearRound e closed input
+  outcomes <- query @Outcome e.alice
+  Some ticket <- pure (snd (head outcomes)).recovery
+  successors <- forA [(loser.currentLock,cashContext e),(loser.currentReceipt,tokenContext e)] $ \(cid,args) -> do
+    result <- submit (actAs e.alice <> discloseMany e.disclosures) do
+      exerciseCmd cid A.Allocation_Withdraw with actors = [e.alice]; extraArgs = args
+    A.AllocationResult_Pending current <- pure result.output
+    pure current
+  let [current,receipt] = successors
+  e <- withRegistryDisclosures e
+  submitMustFail (actAs t.ao <> readAs t.av <> discloseMany e.disclosures) do
+    exerciseCmd (grant e Recovery) Release with
+      ticket; current = loser.currentLock; receipt = loser.currentReceipt
+      fundingArgs = cashContext e; receiptArgs = tokenContext e
+  assertActive t.av ticket
+  _ <- releaseTicket e ticket current receipt
+  assertGone t.av ticket
+  forA_ successors $ \cid -> assertGone t.av (fromInterfaceContractId @TokenAllocationV2 cid)
+  balance e.alice losingTerms.payment t.cashInstrument False >>= (=== 400.0)
+  submitMustFail (actAs t.ao <> readAs t.av <> discloseMany e.disclosures) do
+    exerciseCmd (grant e Recovery) Release with
+      ticket; current; receipt; fundingArgs = cashContext e; receiptArgs = tokenContext e

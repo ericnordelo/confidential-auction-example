@@ -1,401 +1,753 @@
 # Confidential auction flows and authority
 
-This report follows one sealed-bid auction from the issuer's proposal through
-funding, batch acceptance, close, clearing and recovery. The accompanying Daml
-contracts implement that workflow using actual Token Standard V2 allocations
-and two instances of the pinned OpenZeppelin experimental token registry.
+This report follows the executable auction from preparation through batch
+acceptance, clearing and recovery. It uses two instances of Splice's
+[TestTokenV2](https://github.com/canton-network/splice/tree/69b43eb761e38695052c983715aa855c8cb207fc/token-standard/examples/splice-test-token-v2),
+one for payment and one for inventory. The upstream Daml source is unchanged.
 
-The worked example sells 100 tokens in lots of 10. Alice requests 50 at a maximum
-price of 12, Bob requests 80 at 10, and Carol requests 40 at 10. The result is
-50, 40 and 10 tokens respectively, all at price 10.
+The issuer and bidders authorize committed, iterated allocations before opening
+or admission. Clearing computes the exact transfers, adds their sides to those
+existing allocations and settles both assets in one transaction. Finalization
+uses `nextIterationFunding = None`, so the registries return unused funding to
+the original accounts during settlement.
 
-The operator's restricted grant enforces the complete clear. Governance must
-preserve those approved entry points and restrict direct submissions as `av`.
-If someone can submit directly as `av`, the contracts permit other valid Daml
-transactions, including settling only the payment side. The authority
-demonstration executes that counterexample explicitly.
+The worked auction sells 100 tokens in lots of 10. Alice requests 50 at a maximum
+price of 12, Bob requests 80 at 10, and Carol requests 40 at 10. They receive
+50, 40 and 10 tokens respectively, all at price 10. The separate custody example
+has one bidder, so Alice receives 50 at reserve 8 and recovers 200 of her 600
+reserved payment.
 
 ## Parties and authority
 
 | Party | Responsibility |
 |---|---|
-| Issuer | Approves the round terms and use of its inventory and proceeds accounts |
-| Bidder | Approves its quantity, maximum price and payment and delivery accounts |
-| Account provider | Supplies any additional consent required for its accounts |
-| `ao` | Submits the operator's fixed preparation, admission, close, clear and recovery workflows |
-| `av` | Signs auction state and delegation grants and is the allocation executor |
-| Cash and token admins | Operate the two asset registries |
-| Eligibility provider | Signs and updates bidder credentials |
-| Settlement attester | Approves settlement when required by the chosen policy |
-| Auditor | Reads the disclosed history and checks membership, results and recovery |
+| Issuer | Approves round terms, inventory delivery and payment receipt. |
+| Bidder | Submits signed bid terms and requests payment and receipt allocations. |
+| Account provider | Approves the account policy and the allocations required by that policy. |
+| `ao` | Coordinates round preparation, batch admission, close, clear and recovery. |
+| `av` | Signs auction state and grants and is the sole allocation executor. |
+| Cash and token admins | Operate the two upstream asset registries. |
+| Eligibility provider | Signs and updates bidder credentials. |
+| Settlement attester | Signs the application's optional approval of the exact settlement. |
+| Auditor | Checks disclosed membership, results, asset movements and recovery. |
 
-In the notation below, `S` is a contract's signatory set and `C` is a choice's
-controller set. Exercising a choice requires its controllers' authority. Inside
-that choice, the available authority is its controllers plus its contract's
-signatories. A further nested choice gets its own controllers and signatories.
-It does not inherit every other party from earlier ancestors.
+In the pseudocode, each `TX` is a separate submission. Indented calls happen
+inside that submission. `S` names a contract's signatories and `C` names a
+choice's controllers. A caller must supply the controllers' authority. A choice
+body uses its own controllers and contract signatories as authorizers for its
+nested actions. This rule is applied again at each nested exercise. Creating a
+contract requires the authority of all its signatories.
 
-The token interfaces call their selected authorizers `actors`. Naming a party
-in that list does not manufacture consent. The exercise must already have that
-party's authority, and the registry also checks that the actors satisfy its rule.
+Token Standard choices name their controllers through `actors`. Naming a party
+there requires its authority and must satisfy the registry's authorization
+rules. Operator submissions use `actAs ao` and `readAs av`. The latter provides
+read access to `av`'s projection. Its authority comes from exercising the
+`av`-signed grant, rather than from `readAs`.
 
-The scripts submit operator commands with `actAs ao` and `readAs av`. This models
-the operator's authorized access to its co-hosted validation party's projection.
-`readAs` supplies visibility, not the right to exercise an `av`-controlled
-choice. The authority tests verify that distinction. Factory and input-holding
-disclosures model information supplied by registries and account services.
+[Workflow.daml](auction/daml/Auction/Workflow.daml) defines the application
+choices. [Assets.daml](auction/daml/Auction/Assets.daml) calls the token interfaces.
+The [Daml authorization model](https://docs.canton.network/appdev/modules/m3-authorization)
+explains the underlying rule.
 
-The asset helper uses `AllocationFactory_PublicFetch` to read the registry under
-the account parties' authority, then calls `AllocationFactory_Allocate`. See
-[Auction.Assets](auction/daml/Auction/Assets.daml) and the
-[Daml authorization model](https://docs.canton.network/appdev/modules/m3-authorization).
+## Allocation approvals and registry context
+
+Before creating allocations, the setup scripts create each registry's
+`TokenRules`, signed by its admin. For accounts with a provider, they also agree
+on an upstream `AccountConfig`:
+
+```text
+TX  provider -> create AccountProposal(config), S = provider
+TX  owner -> AccountProposal_Accept, C = owner, S = provider
+      create AccountConfig, S = owner + provider, observer = admin
+
+TX  av -> create separate Grant contracts for each operation category
+      S = av, observer = ao
+```
+
+The example configures both owner and provider to approve account actions.
+Basic accounts have no provider and use the owner's authority. Account policy
+is distinct from consent to an individual bid or allocation. Test funding uses
+Splice's mint-offer and transfer-acceptance flow through the script-only
+`MintConsent` helper.
+
+All auction allocations use the same full settlement reference:
+
+```text
+SettlementInfo
+  executors = [av]
+  id        = "auction-clear"
+  cid       = Some roundId
+  meta      = emptyMetadata
+```
+
+`roundId` is the `RoundPreparation` contract ID, fixed before funding. It
+persists in the funding request or proposal, published terms and every round
+state. The current `Round` contract ID changes whenever a batch is accepted or
+bidding closes.
+
+Each initial allocation has `transferLegSides = []`, `committed = True` and the
+round's settlement deadline. Its funding depends on the account's role:
+
+| Authorization | Initial `nextIterationFunding` | Reserved funds |
+|---|---|---:|
+| Issuer inventory send | `Some {ISSUE: 100}` | 100 tokens |
+| Issuer payment receipt | `Some {}` | None |
+| Alice payment send | `Some {USD: 600}` | 600 payment units |
+| Alice token receipt | `Some {}` | None |
+
+`Some {}` enables iterated settlement without reserving funds. It allows the
+executor to supply a receiving side once the fill is known. Setting this field
+to `None` at creation would permit only the original fixed sides. Setting it
+to `None` in a later `FinalizedAllocation` ends the allocation after that
+settlement and releases the remainder. These are different uses of the field.
+See [CIP-0112 section 4.3.6](https://github.com/canton-foundation/cips/blob/6f37c896a5a76ec3bc1aa67bc045623ae5df41e5/cip-0112/cip-0112.md#436-committed-allocations-and-iterated-settlement).
+
+Splice's `ExtraArgs` supplies the event-log registry ID and any required
+account-configuration contract IDs. Allocation creation also needs input-holding
+disclosures. Settlement and cancellation need fresh disclosures of the locked
+holdings. The scripts simulate the registry's context service through
+`withRegistryDisclosures`, querying the admin's records. The operator still
+submits as `ao`, with no admin submission authority.
+
+`Assets.requestAllocation` checks the registry admin through
+`AllocationFactory_PublicFetch`, then calls `AllocationFactory_Allocate`. Bid
+creation supplies only the bidder as an actor, and round funding supplies only
+the issuer. Registry instructions collect any additional account approvals.
+
+The auction validates the pinned `TokenAllocationV2` template, allocation root,
+exact specification, settlement reference and recorded funding keys. It requires
+`numIterations = 0` before clear. Funding amounts are established by the upstream
+registry implementation. The round does not fetch each private holding to
+recalculate those amounts. The scripts inspect resulting balances separately.
 
 ## 1. Prepare and open the round
 
-The issuer supplies the intended terms. The operator creates a preparation
-contract, and the issuer and its account provider approve those exact terms in
-separate transactions. Each approval consumes its predecessor and adds the
-approver as a signatory of the successor.
+The issuer approves the round terms and requests inventory-send and
+proceeds-receipt allocations in one transaction. Basic accounts complete
+immediately. Custodied accounts use the registry's allocation instructions to
+collect provider approval.
+
+### Request funding
+
+`ao` creates the preparation through its grant. The issuer then exercises
+`FundRound`, supplying the live preparation grant, inventory holdings and
+registry context.
 
 ```text
-T1  ao -> Preparation Grant.StartRound(terms)
+TX  ao -> Preparation Grant.StartRound(terms)
       Grant S = av, C = ao
-      create RoundPreparation S = av
+      create RoundPreparation, S = av
 
-T2  issuer -> RoundPreparation.ApproveRound(issuer)
-      consume preparation
-      create successor S = av + issuer
+TX  issuer -> RoundPreparation.FundRound(preparation grant, inventory inputs, context)
+      S = av, C = issuer
+      check the live preparation grant and bidding deadline
+      roundId = this preparation's contract ID
+      request inventory-send allocation, actors = [issuer]
+        nextIterationFunding = Some {ISSUE: 100}
+      request proceeds-receipt allocation, actors = [issuer]
+        nextIterationFunding = Some {}
 
-T3  issuer provider -> ApproveRound(provider)
-      consume preparation
-      create successor S = av + issuer + provider
+      if both results are Completed:
+        create SaleAuthority and Proposal, S = issuer + av
+        bind both allocation roots
+        return FundedRound(proposal)
+      otherwise:
+        create RoundFundingRequest, S = issuer + av
+        retain fixed terms, roundId and both initial registry results
+        return RegistryPreparedRound(request)
 
-T4  ao -> RoundPreparation.FundRound(inventory holdings)
-      C = ao, S = av + all required issuer account parties
-      check complete consent and bidding deadline
-      registry.PublicFetch(actors = inventory account parties)
-      registry.Allocate(actors = inventory account parties)
-      create committed supply allocation, executor = [av]
-      create SaleAuthority S = av + issuer account parties
-      create Proposal S = issuer + av
-      consume preparation
-
-T5  ao -> Opening Grant.OpenRound(proposal, current supply allocation)
-      -> Proposal.Proposal_Open, C = av, S = issuer + av
-         validate funded, unmarked supply and deadline
-         -> SaleAuthority.BindSale, C = av
-         create Round(Open, accepted = [], nextNumber = 0)
-         create PublishedTerms
-         consume proposal
+      consume RoundPreparation
 ```
 
-The initial supply allocation authorizes the sender side of a leg from the
-inventory account back to itself. It reserves inventory without choosing winners
-or supplying the receiver approval needed for settlement. Its settlement reference
-contains the preparation identity, and its executor list is exactly `[av]`.
-It is committed through the settlement deadline.
+Each factory has its asset admin as signatory. It combines that authority with
+the issuer's `actors` to create either a completed allocation or a pending
+instruction. The completed allocation carries the registry's required account
+consent. Providers remain observers of the auction records and sign only the
+asset contracts required by their registries.
 
-Funding and creation of the proposal and sale authority are one transaction.
-Opening is a later transaction. A failed funding transaction leaves the signed
-preparation available. Consuming the proposal prevents a second opening through
-that proposal. Its contract ID becomes the stable round identity, copied into
-every round successor and the published terms.
+A failure in either registry rolls back the whole funding submission and
+preserves the preparation and input holdings. A pending result commits the
+instruction and auction request. In this registry, pending instructions leave
+inventory available until approval, so the issuer must keep the inputs usable.
 
-The prototype checks the bidding and settlement cutoffs. It does not enforce
-separate minimum preparation or clearing margins when opening a round.
-
-Read [Opening](scripts/daml/Flows/Opening.daml) for the individual submissions.
-
-## 2. Prepare and fund each bid
-
-Preparation uses a separate contract per bid. It does not update the round.
-Alice can prepare while Bob prepares, provided they do not compete for the same
-holding or another shared account resource. The scripts demonstrate independent
-states through sequential submissions, rather than benchmarking parallel clients.
+### Complete custody approval
 
 ```text
-ao -> Preparation Grant.StartBid(published terms, Alice's bid)
-  create BidPreparation S = av
+TX  issuer provider -> inventory instruction.AllocationInstruction_Accept
+      actors = [provider], existing instruction S = token admin + issuer
+      reserve 100 tokens and consume the instruction
+      create inventory allocation, S = token admin + issuer + provider
+        observer = av
 
-Alice -> ApproveBid(Alice)
-  successor S = av + Alice
-
-Alice's account provider -> ApproveBid(provider)
-  successor S = av + Alice + provider
-
-ao -> BidPreparation.FundBid(payment holdings)
-  require all payment and delivery account approvals
-  maximum payment = roundUp(quantity * maximum price)
-  registry.Allocate(actors = payment account parties)
-  create committed payment allocation, executor = [av]
-  create PreparedBid S = av + Alice + account parties
-  consume BidPreparation
+TX  issuer provider -> proceeds instruction.AllocationInstruction_Accept
+      actors = [provider], existing instruction S = cash admin + issuer
+      consume the instruction
+      create unfunded proceeds allocation, S = cash admin + issuer + provider
+        observer = av
 ```
 
-Alice's example reserves 600. The registry consumes her input holdings and
-creates locked holdings for that amount. The prepared bid binds the allocation
-root, complete fixed terms, both accounts and round identity. It has no acceptance
-number and no right to a fill.
+These are registry transactions. They leave `RoundFundingRequest` unchanged.
+One side may have completed in the issuer's initial submission while the other
+needs approval. The operator waits for both completed allocation IDs.
 
-The account approvals supply authority later. A recorded account-party identifier
-alone would not do that. The [Funding](scripts/daml/Flows/Funding.daml) script
-separately rejects missing provider consent and a 599-unit payment input.
+### Open the round
+
+```text
+TX  ao -> Opening Grant.OpenRound(source, current inventory, current proceeds receipt)
+      Grant S = av, C = ao
+      check the opening grant against the source's fixed terms
+
+      if source is RegistryPreparedRound:
+        -> RoundFundingRequest.CompleteFunding
+           S = issuer + av, C = av
+           validate both completed allocations against the fixed terms and roundId
+           preserve the root of any initially completed side
+           consume the request and create SaleAuthority + Proposal
+
+      -> Proposal.Proposal_Open, S = issuer + av, C = av
+         validate both allocation bindings and the bidding deadline
+         -> SaleAuthority.BindSale(roundId), S = issuer + av, C = av
+         create Round(Open, accepted = [], nextNumber = 0)
+           S = issuer + av, observer = ao
+         create PublishedTerms, S = issuer + av, observer = ao
+         consume Proposal
+```
+
+The opening grant supplies `av` authority to the nested choices. The issuer's
+signed proposal or funding request supplies its terms approval. Provider
+authority is already carried by the allocations and is needed only inside
+registry operations.
+
+For a custody request, binding and opening commit in one transaction. An
+incomplete or invalid allocation preserves the request, and consuming it on
+success prevents another opening. Immediate funding uses the existing proposal.
+The same `roundId` persists through both paths. Opening must precede the bidding
+cutoff. Minimum preparation and clearing margins remain outside this prototype.
+
+The issuer can abandon an unfunded preparation without asset cleanup. Abandoning
+an immediate funded proposal creates a recovery ticket for its bound allocation
+pair. Abandoning a `RoundFundingRequest` consumes the request, while registry
+withdrawal handles pending instructions and completed committed allocations.
+The latter remain committed until registry withdrawal is permitted.
+
+Read [Opening](scripts/daml/Flows/Opening.daml) for immediate, custody and mixed
+funding, binding checks, preparation pause and proposal abandonment.
+[Recovery](scripts/daml/Flows/Recovery.daml) shows withdrawal after abandoning
+pending or partly funded round requests.
+
+## 2. Submit each bid
+
+The bidder creates its bid and requests both allocations in one transaction.
+The registry decides whether the account policy permits immediate completion or
+requires an allocation instruction. Account-provider approvals use registry
+choices. They are separate from the bidder's consent to its auction terms.
+
+`SubmitBid` is a non-consuming choice on `PublishedTerms`. It leaves the round
+and published terms active, so bids with distinct funding inputs and account
+resources can prepare independently. The scripts submit sequentially and do not
+benchmark concurrent clients.
+
+```text
+TX  bidder -> PublishedTerms.SubmitBid(bid, payment inputs, registry context)
+      S = issuer + av, C = bidder
+      fetch and check the live Preparation Grant
+      check bid terms and time < bidding deadline
+      maximum payment = roundUp(quantity * maximum price)
+
+      -> cash factory.AllocationFactory_Allocate
+         factory S = cash admin, actors = [bidder]
+         nextIterationFunding = Some {USD: maximum payment}
+         result = Completed(payment allocation) or Pending(payment instruction)
+
+      -> token factory.AllocationFactory_Allocate
+         factory S = token admin, actors = [bidder]
+         nextIterationFunding = Some {}
+         result = Completed(receipt allocation) or Pending(receipt instruction)
+
+      if both results are Completed:
+        create PreparedBid, S = av + bidder
+        retain both allocation roots and the exact bid terms
+        return FundedBid(PreparedBid)
+      otherwise:
+        create BidRequest, S = av + bidder
+        retain the exact bid terms and both initial registry results
+        return RegistryPreparedBid(BidRequest)
+```
+
+The bidder supplies the choice's controller authority. The published terms supply
+`av` authority to create the signed application record. Each registry factory
+uses its own admin authority and the bidder's authorization to process the
+allocation request. Providers observe the application record but sign only the
+registry approvals required by their account policy.
+
+A failed factory call rolls back the whole submission, including any allocation
+created by the first registry. A `Pending` result commits the instruction and
+bid request. Payment and receipt can have different readiness states.
+
+### 2.1 Immediate allocations
+
+Bob uses accounts without a provider. His one `SubmitBid` transaction reserves
+600 for a bid of 50 tokens at maximum price 12, creates the unfunded receipt
+allocation and creates `PreparedBid`. The operator can then include it in a
+batch. Both allocations and the signed bid exist before admission.
+
+`PreparedBid` has no acceptance number. The bidder can abandon it and obtain a
+recovery ticket for the two allocations created by its submission.
+[Bidding](scripts/daml/Flows/Bidding.daml) demonstrates immediate creation,
+authorization checks and batch admission. [Funding](scripts/daml/Flows/Funding.daml)
+checks insufficient inputs and rollback when the second registry fails.
+
+### 2.2 Custodian approval
+
+Alice's account policies require her provider's approval. Her single `SubmitBid`
+transaction creates two upstream `AllocationInstruction` contracts and a
+`BidRequest`, signed by Alice and `av`. The request stays active while each
+registry collects its account approvals.
+
+```text
+TX  Alice -> PublishedTerms.SubmitBid
+      payment = Pending(cash instruction)
+      receipt = Pending(token instruction)
+      create BidRequest, S = av + Alice
+      each instruction S = its registry admin + Alice
+
+TX  Alice provider -> cash instruction.AllocationInstruction_Accept
+      actors = [provider], S = cash admin + Alice
+      reserve 600, consume the instruction
+      result = Completed(payment allocation)
+
+TX  Alice provider -> token instruction.AllocationInstruction_Accept
+      actors = [provider], S = token admin + Alice
+      create unfunded receipt allocation, consume the instruction
+      result = Completed(receipt allocation)
+
+TX  ao -> Admission Grant.AcceptBatch
+      include RegistryPreparedBid(BidRequest)
+      supply both completed allocation IDs and current credential
+      bind and accept inside the batch transaction described in section 3
+```
+
+A pending payment instruction in this registry leaves its inputs unlocked. Those
+holdings must still be available when the provider completes it. Payment funding
+alone is insufficient for admission while receipt approval is pending.
+
+The initial results let the wallet follow the registry workflows. Acceptance
+checks the actual completed allocations against the bid's accounts, funding and
+full round reference. It binds them and consumes `BidRequest` in the same
+transaction. Before acceptance, abandoning this request creates no application
+cancellation ticket. Registry withdrawal handles its instructions and allocations,
+so another unaccepted request cannot gain recovery authority over accepted funds.
+
+Read `custodianApproval` and `mixedReadiness` in
+[Iterated](scripts/daml/Flows/Iterated.daml) for two pending approvals and a
+completed receipt with pending payment. Both examples clear after registry
+approval without another bidder or provider submission at settlement.
 
 ## 3. Accept bids in batches
 
-The round's accepted list is the authoritative auction membership. A prepared
-bid becomes a member only when a committed batch consumes it and appends the
-resulting accepted-bid contract ID to that list.
+A committed batch appends accepted-bid contract IDs to the round's private list.
+That list determines membership. Both bid sources can use the same batch:
+
+- `FundedBid` names a `PreparedBid` created with two immediate allocations.
+- `RegistryPreparedBid` names a signed `BidRequest` whose allocations have
+  completed their registry workflows.
 
 ```text
-ao -> Admission Grant.AcceptBatch(current round, [Alice, Bob], evidence)
-  -> Round.Round_AcceptBatch, C = av, S = issuer + av
-     require Open and ledger time < bidding deadline
-     require distinct prepared IDs and batch/round capacity
-     validate the current supply lock
-     for each prepared bid in the supplied order:
-       validate round, accounts, terms, exact funded lock and eligibility
-       -> PreparedBid.Prepared_Accept
-          C = issuer + av
-          S = av + bidder + account parties
-          create AcceptedBid with the next acceptance number
-          consume PreparedBid
-     create one round successor with appended IDs and updated nextNumber
-     consume the previous round
+TX  ao -> Admission Grant.AcceptBatch(round, ordered bids, issuer allocations)
+      Grant S = av, C = ao
+      -> Round.Round_AcceptBatch, S = issuer + av, C = av
+         require Open, time < bidding deadline and batch/round capacity
+         read each source's authenticated terms and allocation bindings
+         reject duplicate sources and allocation roots reused within the
+           batch or by an already accepted bid
+         validate issuer inventory and proceeds allocations
+
+         for each source in the supplied order:
+           validate round, terms, payment and receipt allocations
+           validate current eligibility and retain its credential identity
+           if FundedBid:
+             -> PreparedBid.Prepared_Accept
+                C = issuer + av, S = bidder + av
+                consume PreparedBid
+           if RegistryPreparedBid:
+             -> BidRequest.AcceptRegistryPrepared
+                C = issuer + av, S = bidder + av
+                validate and bind the completed allocations
+                consume BidRequest
+           create AcceptedBid with the next acceptance number
+             S = issuer + av + bidder
+             account providers and ao observe it
+
+         create one Round successor with appended IDs and updated nextNumber
+         consume the prior Round
 ```
 
-The operator selects batch order. Alice and Bob get numbers 0 and 1. A later
-batch containing Carol gets number 2. A rejected batch assigns no numbers and
-accepts no bids, even if its first bid passed before a later bid failed.
+The round supplies issuer and `av` authority to the acceptance choice. The
+bid source supplies bidder authority, allowing the accepted record to carry
+all three signatures. Providers' asset consent remains in their allocations.
 
-There is still one serialization point: the current round contract. Batching
-reduces round replacements from one per bid to one per batch. It does not remove
-contention, guarantee throughput, or prove fairness of off-ledger arrival order.
-An operator should bound batch size and waiting time and reconcile the current
-round ID before retrying.
+All bids share the round's `SettlementInfo`. Separate bids, including identical
+ones, need separate allocation pairs so their funding is counted once and each
+recovery ticket releases only its own allocations.
 
-Each bidder can see its own acceptance number. Multiple bids can therefore
-reveal intervening acceptance counts. The private full list remains visible to
-the issuer, operator and validation party. The closed list fixes membership,
-not merely a count or an operator-supplied claim that the book is complete.
+The operator chooses order within each batch. A batch starting at number `n`
+assigns consecutive numbers and replaces the round once. One invalid or
+unconfirmable input rejects the entire transaction, preserving the sources,
+allocations and previous round. Competing batches still contend on that round.
 
-Read [Bidding](scripts/daml/Flows/Bidding.daml) for the rollback and stale-round
-examples.
+The issuer, operator and validation party see the accepted list. Each bidder
+sees its own accepted record and number. Comparing several numbers can reveal
+acceptance activity. The stored order does not prove fair ordering of off-ledger
+requests, and the operator can refuse or delay admission before it commits.
 
-## 4. Close and compute the result
+[Bidding](scripts/daml/Flows/Bidding.daml) exercises batch rollback and stale round
+IDs. `allocationReuseGuard` and `roundReferenceGuard` in
+[Iterated](scripts/daml/Flows/Iterated.daml) check duplicate funding and use of
+allocations from another round.
 
-At or after the bidding deadline, the close grant exercises the current round
-and creates its `Closed` successor. It preserves every accepted ID and order
-number. Admission then fails because the round is closed or the deadline passed.
-
-The operator computes a proposed result off ledger from the closed book. The
-clear recomputes the result on ledger and rejects a mismatch. Both use
-`computeResult`. The off-ledger proposal does not remove the on-ledger calculation.
-
-Higher price bands fill first. An oversubscribed marginal band receives
-proportional whole-lot floors, with remaining lots assigned by acceptance order.
-The uniform price is the reserve when eligible demand is at most supply, and
-otherwise the lowest winning maximum price. The same upward quantum rounding
-applies to the initial maximum payment and the final payment.
+## 4. Close bidding and compute the result
 
 ```text
-Supply: 10 lots of 10 tokens, reserve price 8
-Alice: 5 lots at 12       -> 5 lots
-Bob:   8 lots at 10       -> 4 lots
-Carol: 4 lots at 10       -> 1 lot
+TX  ao -> Closing Grant.CloseRound(current round)
+      Grant S = av, C = ao
+      -> Round.Round_Close, S = issuer + av, C = av
+         require Open and time >= bidding deadline
+         consume the open round
+         create Closed successor preserving terms, accepted list and order
+```
 
-Remaining marginal supply: 5 lots
+The operator reads the closed book and proposes a result off ledger. The clear
+independently calls `computeResult` on authenticated inputs and rejects a
+mismatch. Closing fixes membership, while current credential status can still
+affect eligibility at clear.
+
+Higher maximum-price bands fill first. The oversubscribed marginal band gets
+proportional whole-lot floors. Leftover lots go by acceptance order within that
+band. Winners pay the reserve when eligible demand is at most supply, otherwise
+the lowest winning maximum price.
+
+```text
+Supply: 10 lots of 10 tokens, reserve 8
+Alice: 5 lots at 12       -> 5 lots, payment 500
+Bob:   8 lots at 10       -> 4 lots, payment 400
+Carol: 4 lots at 10       -> 1 lot, payment 100
+
+Marginal supply: 5 lots
 Proportional floors: Bob 3, Carol 1
-Remaining lot: Bob, because he was accepted earlier
+Leftover lot: Bob, because he was accepted earlier
 Uniform price: 10
-Payments: 500 + 400 + 100 = 1,000
 ```
 
-A current revoked or expired credential, or a live marked payment allocation,
-gives that bid zero fill. Missing current evidence blocks validation. A marked
-supply allocation blocks the clear. A consumed allocation without live funded
-continuation cannot be silently treated as an excluded bid.
+`Credential` is provider-signed and observed by the bidder and `av`. Its update
+consumes the prior status and preserves the original credential identity.
+The provider creates the credential before acceptance. Current revocation or
+expiry gives an accepted bid zero fill. Missing evidence
+blocks validation. A cancelled funding or receipt allocation also blocks the
+clear rather than removing the bid from the accepted set.
 
-## 5. Clear and settle in one transaction
+## 5. Clear and settle atomically
 
-The clear receives the exact accepted IDs in their recorded order, current lock
-and credential references, the proposed result and any required approval. The
-operator cannot remove, add, duplicate, reorder or substitute a bid through this
-choice.
+The clear receives the exact accepted IDs in their recorded order, current
+sending and receiving allocation IDs, current credentials, the proposed result,
+registry context and optional application approval.
 
 ```text
-ao -> Clearing Grant.ClearRound(closed round, evidence, proposed result)
-  -> Round.Round_Clear, C = av, S = issuer + av
-     require ledger time < settlement deadline
-     validate the complete book, current funding and current eligibility
-     recompute and check the proposed result
+TX  ao -> Clearing Grant.ClearRound(closed round, ClearInput)
+      Grant S = av, C = ao
+      -> Round.Round_Clear, S = issuer + av, C = av
+         require Closed and time < settlement deadline
+         validate the exact accepted list and both issuer allocations
+         validate both allocations and current credential for every bid
+         recompute price, fills and rounded payments
+         require the proposed result to match
+         construct the exact payment and delivery legs
 
-     for every accepted bid:
-       -> AcceptedBid.FinalizeBid(own fill, price, current payment allocation)
-          C = av, S = issuer + av + bidder + account parties
-          validate its local quantity and maximum-payment bounds
-          if it wins:
-            cancel original payment allocation, actors = [av]
-            receive unlocked holdings back into the same account
-            allocate exact payment sender side using those holdings
-            allocate exact token receiver side with no funding input
-          else:
-            retain original payment lock and create a recovery ticket
-          create the bidder's private outcome
-          consume AcceptedBid
+         for every accepted bid:
+           -> AcceptedBid.FinalizeBid(current payment, current receipt,
+                                      own fill, clearing price)
+              S = issuer + av + bidder, C = av
+              check local quantity, price and payment bounds
+              winner: return FinalizedAllocation values for existing IDs
+                payment allocation: extra sides = [payment sender side]
+                delivery allocation: extra sides = [delivery receiver side]
+                both: nextIterationFunding = None
+              zero fill: retain both allocations and create RecoveryTicket
+                S = av, observers = ao + bid account parties
+              create private Outcome, S = av
+                observers = issuer + ao + bid account parties
+              consume AcceptedBid
 
-     -> SaleAuthority.FinalizeSale(exact payment and delivery legs)
-        C = av, S = av + issuer account parties
-        cancel original supply allocation
-        allocate exact token sender sides using returned holdings
-        allocate exact payment receiver sides
-        consume SaleAuthority
+         -> SaleAuthority.FinalizeSale(current supply, current proceeds,
+                                       price, payment legs, delivery legs)
+            S = av + issuer, C = av
+            check inventory, proceeds and pairing of sale legs
+            return FinalizedAllocation values for existing IDs
+              inventory allocation: extra sides = all delivery sender sides
+              proceeds allocation: extra sides = all payment receiver sides
+              both: nextIterationFunding = None
+            consume SaleAuthority
 
-     verify full-reference auction approval when required
-     cash registry.SettleBatch(all exact cash legs and their allocations)
-     token registry.SettleBatch(all exact token legs and their allocations)
-     create ClearedRound and consume the closed Round
+         when an application attester is configured:
+           -> BatchApproval.VerifyBatch
+              S = attester, C = [av]
+              verify full settlement reference, exact legs and expiry
+              consume approval
+
+         cash registry.SettlementFactory_SettleBatch
+           transferLegs = all winner payment legs
+           allocations = winner payment allocations + issuer receipt allocation
+           actors = [av]
+
+         token registry.SettlementFactory_SettleBatch
+           transferLegs = all winner delivery legs
+           allocations = winner receipt allocations + issuer inventory allocation
+           actors = [av]
+
+         require every allocation result to be Settled with no successor
+         create ClearedRound, S = issuer + av, observer = ao
+         consume the closed Round
 ```
 
-**Every indented operation is part of the same transaction.** The cancellation,
-replacement allocations and both registry settlements are not separate operator
-submissions. The clear either commits all of them or none of them.
+Everything indented under this `TX` commits atomically. `FinalizedAllocation`
+is a value passed to the registry, not a new contract. Winning allocations are
+consumed by the settlement calls. Their unused funds return to their authorizing
+accounts without an intermediate cancellation or replacement allocation.
 
-Cancellation returns funds to the original authorizing account. It does not
-transfer them to `av`. Creating the replacement payment and delivery allocations
-requires the account authority carried by the bid or sale contract. The parent
-round's issuer signature would not by itself supply that authority inside an
-unrelated nested choice.
+### Settlement authority
 
-Each bid child receives its own fill. The issuer child receives the exact sale
-legs, without the winners' original maximum prices. The two factory calls sit
-outside individual bid branches. Registry-specific disclosure and shared account
-providers still affect visibility and need deployment projection tests.
+The factory uses existing allocation consent to perform asset operations:
 
-The [pinned D1 experiment](https://github.com/OpenZeppelin/canton-contracts/blob/7696749737885e25cd88422847105f890f03b00d/experiments/token/tokenCIP112-v1/daml/OpenZeppelin/TokenCIP112V1/D1.daml)
-binds the textual settlement ID, executors and exact legs. The prototype adds
-`BatchApproval` to bind the complete `SettlementInfo`, including its round
-contract ID and metadata. It still invokes the registry's real D1 check.
+```text
+Grant.ClearRound
+  S = av, C = ao
+  -> Round_Clear
+     S = issuer + av, C = av
+     -> cash SettlementFactory_SettleBatch
+        S = cash admin, C = av
+        -> each Allocation_Settle, actors = [cash admin, av]
+           allocation S = cash admin + account owner + any provider
+           body has those account parties' authority
+           consume locked holdings, execute the net debit or credit,
+             and create unlocked payout holdings
 
-`atomicRollbackAndRetry` deliberately omits the token registry's D1 attestation.
-The token factory rejects after the cash factory has run within the transaction.
-The script checks that the original closed round, accepted bid, supply and payment
-locks, and application approval remain active, with no committed proceeds or
-outcome. Supplying the attestation allows the same closed round to clear.
+The token factory follows the same authority chain with token admin.
+```
 
-An empty round returns the supply and records a zero-sale result without calling
-either factory with an empty settlement batch.
+The enclosing factory supplies its admin and `av` authority to the allocation
+choice. The allocation itself supplies the account parties' authority inside
+that choice. `AcceptedBid` and `SaleAuthority` do not need provider signatures to
+create fresh allocations at clear. Bidders and providers make no new submission,
+although the participants required to confirm the transaction must be available.
+
+The application enforces the accepted set, pricing and bid bounds. The registry
+checks matching sending and receiving sides for each transfer and performs net
+account movements. All allocations keep the same full round settlement reference
+through preparation and clear.
+
+### Transfers and refunds
+
+For each winner, payment moves from its payment account to issuer proceeds,
+and inventory moves from issuer inventory to its delivery account. Each leg
+has a deterministic ID based on the acceptance number. The two registries
+receive the corresponding leg sets and authorizations.
+
+| Account | Initially reserved | Movement | Returned or received unlocked |
+|---|---:|---:|---:|
+| Alice payment | 600 | Pays 500 | 100 returned |
+| Bob payment | 800 | Pays 400 | 400 returned |
+| Carol payment | 400 | Pays 100 | 300 returned |
+| Issuer inventory | 100 tokens | Delivers 100 | No remaining inventory |
+| Issuer proceeds | No funding | Receives 1,000 | 1,000 payment units |
+
+The one-bid custody example pays 400 for 50 tokens. It returns Alice's remaining
+200 and the issuer's unsold 50 tokens. `preparedAllocationsAndRefunds` also checks
+that all four original allocations are consumed with no successors.
+
+An empty or entirely ineligible round cancels both issuer allocations and records
+zero sales at reserve. It creates outcomes and recovery tickets for any accepted
+zero-fill bids and makes no factory call with an empty movement list. Configured
+application approval still covers the full reference and empty leg sets.
+
+### Rollback and retry
+
+`atomicRollbackAndRetry` supplies a valid application approval and cash context,
+but omits the token account context. The cash factory runs, then the token factory
+fails. The ledger restores the closed round, accepted bid, all four allocations
+and the approval, with no committed proceeds or outcome. Supplying the token
+context allows the same closed round to clear.
+
+`BatchApproval` is an application-level check. The upstream Splice test token
+has no OpenZeppelin D1/D2 extensions. See
+[Controls](scripts/daml/Flows/Controls.daml) and
+[Clearing](scripts/daml/Flows/Clearing.daml).
 
 ## 6. Failure and recovery
 
 | Situation | Result and next step |
 |---|---|
-| A preparation lacks account consent | Funding fails. Obtain the outstanding approval or abandon preparation |
-| Input holdings are insufficient | Funding rolls back. Existing holdings and preparation remain usable |
-| One bid invalidates a batch | No bid in that batch is accepted. Correct or split the batch before cutoff |
-| A prepared bid misses cutoff | It remains unaccepted. Its bidder can abandon it and obtain a recovery ticket |
-| A clear definitively fails before expiry | Original round and commitments remain. Retry the complete accepted set with valid current evidence |
-| A client times out without a final result | Reconcile command completion and ledger state before treating the transaction as rejected |
-| Settlement deadline is reached | Clear fails. The termination grant consumes the round and records an end without sale |
-| Operator cancels an uncleared round | The entire round ends with a reason. This grants no selective early removal from an active round |
-| A bid has zero fill | Its outcome permits separate cancellation of its original lock. An unmarked lock can be released immediately |
-| A lock is marked | Registry cancellation and withdrawal fail until an authorized release of the mark or another registry resolution |
-| Operator recovery is unavailable after expiry | The account parties can invoke the registry's withdrawal path when its deadline and policies allow |
+| Immediate bid creation lacks holdings or valid registry context | The whole submission rolls back. Supply valid inputs and context. |
+| Custody approval is pending | Opening or bid admission waits for both completed allocations. Inputs must remain available until the registry reserves them. |
+| Round funding lacks holdings or valid registry context | The whole issuer submission rolls back, preserving preparation and inputs. |
+| A round funding request is abandoned | Consume the request and withdraw its registry instructions or allocations under registry policy. |
+| One batch input is invalid or reuses an accepted allocation | The entire batch fails, preserving its sources and the prior round. |
+| A funded `PreparedBid` misses admission | The bidder can withdraw it and obtain a ticket for both allocations. |
+| A registry-prepared bid misses admission | Abandon its request. Withdraw pending instructions under account policy, or completed committed allocations after the settlement deadline. |
+| An allocation ID changes | Resolve the active successor and verify its root and unchanged specification. |
+| A required allocation was cancelled | The complete clear fails. Cancellation is not an eligibility exclusion. |
+| A clear definitively fails before the deadline | Retry the complete accepted set with valid current context and evidence. |
+| A submission times out with an uncertain result | Reconcile command completion and ledger state before retrying. |
+| Settlement time expires or the operator cancels the round | Record `EndedRound` and recover each bid and the issuer allocations separately. |
+| A bid receives zero fill | Record its outcome and separately cancel its funding and receipt approvals through its recovery ticket. |
 
-Ending the round and recovering assets are separate operations:
+### Recover through the operator
 
 ```text
-ao -> Termination Grant.EndRound
-  consume the open or closed round
-  create EndedRound retaining the accepted list and sale reference
+TX  ao -> Termination Grant.EndRound(round, expired, reason)
+      Grant S = av, C = ao
+      -> Round.Round_End, S = issuer + av, C = av
+         require a reason and, if expired, time >= settlement deadline
+         consume Round and create EndedRound, S = issuer + av, observer = ao
+         retain accepted membership and the sale reference
 
-For each available accepted bid:
-  ao -> Recovery Grant.CloseUnsettledBid
-    EndedRound checks membership
-    AcceptedBid creates a private outcome and recovery ticket, then is consumed
-  ao -> Recovery Grant.Release(ticket, current allocation)
-    validate allocation lineage and cancel under registry rules
+For each accepted bid, independently:
+TX  ao -> Recovery Grant.CloseUnsettledBid(ended, bid)
+      -> EndedRound.Ended_CloseBid, C = av
+         check membership
+         -> AcceptedBid.CloseBidWithoutSale, C = av
+            consume bid and create Outcome + RecoveryTicket
 
-Supply:
-  ao -> Recovery Grant.CloseUnsettledSupply
-    SaleAuthority creates a recovery ticket and is consumed
-  ao -> Recovery Grant.Release(ticket, current supply allocation)
+TX  ao -> Recovery Grant.Release(ticket, current payment, current receipt)
+      Grant S = av, C = ao
+      -> RecoveryTicket.Recover, S = av, C = av
+         validate both allocation bindings and active successors
+         cancel payment allocation, actors = [av]
+         cancel receipt allocation, actors = [av]
+         return the released payment holdings and consume the ticket
+
+Issuer, independently:
+TX  ao -> Recovery Grant.CloseUnsettledSupply(ended)
+      -> SaleAuthority.CloseSaleWithoutSale, C = av
+         consume sale authority and create a ticket for both issuer allocations
+TX  ao -> Recovery Grant.Release(ticket, current supply, current proceeds)
 ```
 
-This separates recovery across accounts. An unavailable bidder does not need to
-block another bidder's recovery transaction. A bidder whose account parties
-withdraw directly may leave an application recovery record requiring later
-reconciliation. That bookkeeping cleanup is outside this prototype.
+A zero-fill outcome already references its recovery ticket. Abandoning a funded
+proposal likewise creates a ticket covering inventory and proceeds receipt.
+Cancelling an unfunded receipt approval invalidates permission without moving
+assets. Ticket release cancels the pair atomically. Different tickets can recover
+in separate transactions, so another bidder's unavailable account need not
+block that recovery.
 
-The direct-withdrawal script submits jointly as the account owner and provider,
-which are hosted together in the fixture. Separate hosts would need an account
-consent workflow that brings both authorities into the withdrawal choice.
+### Withdraw through the registry
 
-The scripts simulate ledger deadlines with the SDK's time controls. A closed
-wallet is different from an unavailable participant: the user's earlier consent
-remains valid, but the required participant confirmations must still be available
-for a transaction involving its contracts.
+After the settlement deadline, the account parties can complete
+`Allocation_Withdraw` without the operator. The account-withdrawal script submits
+jointly as owner and provider for the payment allocation. The receiving approval
+has its own lifecycle and can also be withdrawn under the registry's rules.
 
-After a definitive rejection for missing confirmations, the round and accepted
-bids remain active. The operator can retry before the settlement deadline once
-the required participants are available. The scripts in this package exercise
-contract behavior in the test engine. Participant outages require a distributed
-network test.
+Before the deadline, an owner-only withdrawal on a custodied account can return
+`Pending` and create an allocation successor without releasing committed funds.
+Provider completion is blocked until the deadline. The owner cannot repeat its
+approval, so this withdrawal has at most one pending successor in the pinned
+registry. Its `originalAllocationCid` identifies the original allocation. The
+`committedWithdrawalSuccessor` script rejects the stale allocation ID and then
+clears using its active successor with `numIterations = 0`. The
+`allocationReuseGuard` script changes both payment and receipt IDs and checks
+that neither can be assigned to another bid. Other registry lifecycles need a
+verified stable root or additional authenticated lineage evidence.
+
+Abandoned `BidRequest` and `RoundFundingRequest` allocations are released
+through registry withdrawal. Pending instructions can be withdrawn by their
+existing approvers. Completed committed allocations follow registry deadlines
+and account policy. The mixed round-withdrawal script demonstrates inventory
+remaining locked until that deadline. Direct registry withdrawal can also leave
+application records requiring reconciliation. Administrative cleanup of those
+records is outside this implementation.
+
+### Funding rollover demonstration
+
+`fundingRollover` is a registry-only demonstration of retaining funding between
+iterations:
+
+```text
+Initial allocation: Some {USD: 600}
+First settlement: pay 200, nextIterationFunding = Some {USD: 300}
+  return 100, create successor reserving 300, numIterations = 1
+Second settlement: pay 150, nextIterationFunding = None
+  return remaining 150, create no successor
+Totals: sender recovers 250, receiver gets 350
+```
+
+The script rejects reserving 500 after paying 200 from 600. The auction itself
+uses one final settlement with `None`. It rejects allocations that have already
+executed a settlement iteration before clear.
 
 ## 7. Audit and governance boundaries
 
-An auditor should retain the accepted records before they are consumed and check:
+An auditor should retain accepted records before consumption and check:
 
-1. Every accepted bid occurs exactly once in the closed list and has the expected
-   round identity and acceptance number.
-2. Current allocation successors preserve their original account, instrument,
-   amount, executor and settlement bindings and remain funded.
-3. Each exclusion has current authenticated evidence.
+1. Every accepted bid appears exactly once in the closed list with its round
+   identity and acceptance number. Its sending and receiving roots are not reused.
+2. Allocations match the expected accounts, instruments, funding, executor,
+   deadline and settlement reference. Successors preserve their bindings.
+3. Every eligibility exclusion has current provider-authenticated evidence.
 4. Recomputed fills, price, rounded payments and totals match the aggregate result.
-5. Every accepted bid has one private outcome, including zero fills, and asset
-   movements and recovery reconcile with those outcomes.
+5. Each accepted bid has one outcome, and committed asset movements, refunds and
+   retained recovery obligations reconcile with those outcomes.
 
-The audit script retains a closed-book snapshot and checks the worked example's
-outcomes and proceeds against independently specified figures. It is a
-demonstration of those checks, not a persistent historical indexer. Signed request
-receipts, failed-command evidence, admission-policy compliance and historical
-exports require additional operator and auditor infrastructure.
+[Audit](scripts/daml/Flows/Audit.daml) checks a retained closed-book snapshot,
+private outcomes and proceeds against independently specified figures.
+It is a script demonstration. Continuous history retention, request receipts,
+failed-command evidence and admission-policy audits require additional services.
 
-The intended hosting topology places `av` on the operator's participant and two
-independent validation participants, with two of three required to confirm. An
-auditor can host `av` with Observation permission, receiving its private auction
-data without submission authority or a confirmation vote. These hosting settings
-are outside the included scripts.
+The intended deployment hosts `av` on the operator participant and two independent
+validation participants, with two confirmations required. An auditor can observe
+`av` without submission authority or a confirmation vote. The included scripts
+run in the Daml test engine and do not configure or validate that topology,
+participant outages or full production transaction projections.
 
-Confirmation, control over the party's namespace, and authority to submit as `av`
-are separate controls. A two-of-three confirmation threshold does not by itself
-restrict direct `av` submissions. Grant administration and topology changes need
-their own governed authorization process.
+Direct submission as `av` remains a trust boundary. In
+`validationPartyTrustBoundary`, privileged `av` finalizes the bid and sale in
+separate submissions, then settles only cash. The issuer receives 400 while Alice
+receives no tokens. Restricting direct `av` submissions and approved code is
+therefore necessary to preserve the operator's complete-clear workflow.
+[Authority](scripts/daml/Flows/Authority.daml) also rejects the operator's direct
+attempts to cancel allocations or finalize a bid without its grant.
 
-`validationPartyTrustBoundary` uses a submission-capable `av`.
-It calls the bid and sale finalization choices in separate transactions,
-then settles only cash. The issuer receives 400 and Alice has no delivered tokens.
-This exposes why governance must restrict direct submissions as `av`. The
-operator cannot do the same thing with its grants.
-The contracts therefore rely on governance preserving the restricted operator
-entry points. They do not guarantee atomic exchange against unrestricted `av`
-authority.
+Grant instances govern separate operation categories. `StartRound`,
+`FundRound` and `SubmitBid` require a live preparation grant. Revocation stops
+new preparations and funding or bid requests. Existing registry instructions
+can still complete. The independently governed opening and admission grants
+allow those completed requests to open or be accepted before the cutoff. Close,
+clear and recovery use their own grants. The pause scripts exercise preparation
+and admission revocation separately.
 
-## Scope and sources
+## Scope and executable checks
 
-The executable model uses two distinct asset admins, fixed account-owner consent,
-explicit provider approval, bounded whole-lot bids and at most 64 accepted bids.
-It uses synchronous, non-iterated allocations and the specific registry's D2
-successor rules. It covers D1 approval, credential revocation, marking/unmarking,
-normal recovery and committed-allocation withdrawal. Seizure sweeps, registry
-upgrades, fees, external-party signatures, historical replay and production
-load testing require further work.
+The implementation uses two distinct asset admins, bounded whole-lot bids,
+fixed account owners and at most 64 accepted bids. Its completed allocations
+carry asset consent, while its application contracts authenticate terms and
+control admission, clearing and recovery. Minimum timing margins, fees,
+registry upgrades, external-party signing, administrative reconciliation and
+production load testing remain implementation decisions outside this prototype.
 
-The registry is copied without edits from
-[OpenZeppelin/canton-contracts at `7696749`](https://github.com/OpenZeppelin/canton-contracts/tree/7696749737885e25cd88422847105f890f03b00d/experiments/token/tokenCIP112-v1).
-Its canonical Token Standard DARs are included under `vendor/dars/vendor/`.
-The interface specification is
-[CIP-0112 at `6f37c89`](https://github.com/canton-foundation/cips/blob/6f37c896a5a76ec3bc1aa67bc045623ae5df41e5/cip-0112/cip-0112.md).
-Dependency versions, checksums and licenses are recorded in
-[vendor/README.md](vendor/README.md). [The README](README.md#run) explains how to
-run the scripts.
+| Script | Main checks |
+|---|---|
+| [Opening](scripts/daml/Flows/Opening.daml) | Immediate and custody round funding, both mixed states, fixed roots, one opening and preparation pause. |
+| [Funding](scripts/daml/Flows/Funding.daml) | Issuer authority, insufficient holdings, second-registry rollback, consumed inputs and funding cutoff. |
+| [Bidding](scripts/daml/Flows/Bidding.daml) | Immediate bidder creation, authorization, preparation pause, batch admission and numbering. |
+| [Clearing](scripts/daml/Flows/Clearing.daml) | Complete result, exact payments, deliveries, refunds and empty rounds. |
+| [Iterated](scripts/daml/Flows/Iterated.daml) | Custody instructions, receipt approval, allocation reuse, round references, refunds, rollover and active successors. |
+| [Controls](scripts/daml/Flows/Controls.daml) | Credential revocation, missing allocations, application approval, rollback and admission pause. |
+| [Recovery](scripts/daml/Flows/Recovery.daml) | Abandoned round and bid requests, instruction withdrawal, late admission, missed settlement and zero fills. |
+| [Authority](scripts/daml/Flows/Authority.daml) | Operator restrictions and the direct-`av` counterexample. |
+| [Audit](scripts/daml/Flows/Audit.daml) | Accepted membership, outcomes and proceeds. |
+| [Math](scripts/daml/Flows/Math.daml) | Price bands, proportional lots, exclusions and rounding. |
+
+The scripts verify immediate allocation, custodian approval and mixed readiness
+for both round funding and bids, alongside atomic rollback, registry withdrawal
+and the complete auction flows. Source hashes and build adjustments are recorded in
+[vendor/splice-test-token-v2/SOURCE.json](vendor/splice-test-token-v2/SOURCE.json).
+Interface DAR versions, checksums and licenses are recorded in
+[vendor/dars/manifest.yaml](vendor/dars/manifest.yaml). See
+[README.md](README.md#run) for the run commands.
