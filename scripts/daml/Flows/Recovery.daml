@@ -184,30 +184,6 @@ accountWithdrawal = do
   _ <- submit (actAs [e.alice, e.aliceProvider] <> discloseMany e.disclosures) do exerciseCmd bid.currentLock withdraw
   balance e.alice (bidTerms e e.alice 5 12.0).payment e.terms.cashInstrument False >>= (=== 600.0)
 
--- A losing bid is finalized without cancelling its allocation in the clear.
--- Recovery cancels both its funding and unfunded receipt approval before expiry.
-zeroFill : Script ()
-zeroFill = do
-  e <- setup "zero" False
-  (r0, published, supply) <- openRound e
-  Some initialRound <- queryContractId e.terms.av r0
-  let receipt = initialRound.proceedsReceipt.root
-  winner <- prepareBid e published (bidTerms e e.alice 10 12.0)
-  loser <- prepareBid e published (bidTerms e e.bob 5 8.0)
-  r1 <- acceptBatch e r0 supply [winner,loser]
-  closed <- closeRound e r1
-  input <- clearInput e closed supply [winner,loser]
-  _ <- clearRound e closed input
-  outcomes <- query @Outcome e.bob
-  let (_, outcome) = head outcomes
-  outcome.fill.lots === 0
-  balance e.bob (bidTerms e e.bob 5 8.0).payment e.terms.cashInstrument True >>= (=== 400.0)
-  Some ticket <- pure outcome.recovery
-  _ <- releaseTicket e ticket loser.currentLock loser.currentReceipt
-  assertGone e.terms.av (fromInterfaceContractId @TokenAllocationV2 loser.currentLock)
-  assertGone e.terms.av (fromInterfaceContractId @TokenAllocationV2 loser.currentReceipt)
-  balance e.bob (bidTerms e e.bob 5 8.0).payment e.terms.cashInstrument False >>= (=== 400.0)
-
 -- A ticket for an abandoned bid cannot cancel an identical accepted bid, even
 -- in the same round. Nor can it cancel matching accounts in another round.
 recoveryIsolation : Script ()
@@ -240,23 +216,25 @@ recoveryIsolation = do
   balance e.bob b.delivery t.tokenInstrument False >>= (=== 50.0)
   balance e.bob b.payment t.cashInstrument False >>= (=== 800.0)
 
--- Registry updates can change both IDs after a zero-fill ticket is created.
+-- Registry updates can change both IDs after a cancelled round creates a ticket.
 -- Recovery checks their bound allocation terms, then cancels once.
 custodyRecoverySuccessor : Script ()
 custodyRecoverySuccessor = do
   e <- setup "recovery-successor" False
   let t = e.terms
-      losingTerms = bidTerms e e.alice 5 8.0
+      terms = bidTerms e e.alice 5 8.0
   (round, published, supply) <- openRound e
-  winner <- prepareBid e published (bidTerms e e.bob 10 12.0)
-  loser <- prepareBid e published losingTerms
-  admitted <- acceptBatch e round supply [winner,loser]
-  closed <- closeRound e admitted
-  input <- clearInput e closed supply [winner,loser]
-  _ <- clearRound e closed input
-  outcomes <- query @Outcome e.alice
-  Some ticket <- pure (snd (head outcomes)).recovery
-  successors <- forA [(loser.currentLock,cashContext e),(loser.currentReceipt,tokenContext e)] $ \(cid,args) -> do
+  bid <- prepareBid e published terms
+  admitted <- acceptBatch e round supply [bid]
+  Some r <- queryContractId t.av admitted
+  ended <- submit (actAs t.ao <> readAs t.av) do
+    exerciseCmd (grant e Termination) EndRound with round = admitted; expired = False; reason = "venue cancelled round"
+  outcome <- submit (actAs t.ao <> readAs t.av) do
+    exerciseCmd (grant e Recovery) CloseUnsettledBid with ended; bid = head r.accepted
+  Some o <- queryContractId t.av outcome
+  Some ticket <- pure o.recovery
+  e <- withRegistryDisclosures e
+  successors <- forA [(bid.currentLock,cashContext e),(bid.currentReceipt,tokenContext e)] $ \(cid,args) -> do
     result <- submit (actAs e.alice <> discloseMany e.disclosures) do
       exerciseCmd cid A.Allocation_Withdraw with actors = [e.alice]; extraArgs = args
     A.AllocationResult_Pending current <- pure result.output
@@ -265,13 +243,13 @@ custodyRecoverySuccessor = do
   e <- withRegistryDisclosures e
   submitMustFail (actAs t.ao <> readAs t.av <> discloseMany e.disclosures) do
     exerciseCmd (grant e Recovery) Release with
-      ticket; current = loser.currentLock; receipt = loser.currentReceipt
+      ticket; current = bid.currentLock; receipt = bid.currentReceipt
       fundingArgs = cashContext e; receiptArgs = tokenContext e
   assertActive t.av ticket
   _ <- releaseTicket e ticket current receipt
   assertGone t.av ticket
   forA_ successors $ \cid -> assertGone t.av (fromInterfaceContractId @TokenAllocationV2 cid)
-  balance e.alice losingTerms.payment t.cashInstrument False >>= (=== 400.0)
+  balance e.alice terms.payment t.cashInstrument False >>= (=== 400.0)
   submitMustFail (actAs t.ao <> readAs t.av <> discloseMany e.disclosures) do
     exerciseCmd (grant e Recovery) Release with
       ticket; current; receipt; fundingArgs = cashContext e; receiptArgs = tokenContext e

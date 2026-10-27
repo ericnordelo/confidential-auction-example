@@ -9,7 +9,9 @@ The issuer and bidders authorize committed, iterated allocations before opening
 or admission. Clearing computes the exact transfers, adds their sides to those
 existing allocations and settles both assets in one transaction. Finalization
 uses `nextIterationFunding = None`, so the registries return unused funding to
-the original accounts during settlement.
+the original accounts during settlement. Bids with zero fill settle both
+allocations with no transfer sides and recover their full payment in that same
+transaction.
 
 The worked auction sells 100 tokens in lots of 10. Alice requests 50 at a maximum
 price of 12, Bob requests 80 at 10, and Carol requests 40 at 10. They receive
@@ -470,10 +472,9 @@ TX  ao -> Clearing Grant.ClearRound(closed round, ClearInput)
               winner: return FinalizedAllocation values for existing IDs
                 payment allocation: extra sides = [payment sender side]
                 delivery allocation: extra sides = [delivery receiver side]
-                both: nextIterationFunding = None
-              zero fill: retain both allocations and create RecoveryTicket
-                S = av, observers = ao + bid account parties
-              create private Outcome, S = av
+              zero fill: return both existing allocations with extra sides = []
+              both cases: nextIterationFunding = None for both allocations
+              create private Outcome with no recovery ticket, S = av
                 observers = issuer + ao + bid account parties
               consume AcceptedBid
 
@@ -495,12 +496,12 @@ TX  ao -> Clearing Grant.ClearRound(closed round, ClearInput)
 
          cash registry.SettlementFactory_SettleBatch
            transferLegs = all winner payment legs
-           allocations = winner payment allocations + issuer receipt allocation
+           allocations = all accepted payment allocations + issuer receipt allocation
            actors = [av]
 
          token registry.SettlementFactory_SettleBatch
            transferLegs = all winner delivery legs
-           allocations = winner receipt allocations + issuer inventory allocation
+           allocations = all accepted receipt allocations + issuer inventory allocation
            actors = [av]
 
          require every allocation result to be Settled with no successor
@@ -509,9 +510,9 @@ TX  ao -> Clearing Grant.ClearRound(closed round, ClearInput)
 ```
 
 Everything indented under this `TX` commits atomically. `FinalizedAllocation`
-is a value passed to the registry, not a new contract. Winning allocations are
-consumed by the settlement calls. Their unused funds return to their authorizing
-accounts without an intermediate cancellation or replacement allocation.
+is a value passed to the registry, not a new contract. Settlement consumes both
+allocations for every accepted bid and the issuer. Unused funds return to their
+authorizing accounts, including the full payment reserved for zero-fill bids.
 
 ### Settlement authority
 
@@ -563,10 +564,19 @@ The one-bid custody example pays 400 for 50 tokens. It returns Alice's remaining
 200 and the issuer's unsold 50 tokens. `preparedAllocationsAndRefunds` also checks
 that all four original allocations are consumed with no successors.
 
-An empty or entirely ineligible round cancels both issuer allocations and records
-zero sales at reserve. It creates outcomes and recovery tickets for any accepted
-zero-fill bids and makes no factory call with an empty movement list. Configured
-application approval still covers the full reference and empty leg sets.
+For a zero-fill bid, both allocations have empty transfer sides at settlement.
+The registry returns all reserved payment as unlocked holdings and closes the
+unfunded receipt allocation. In `zeroFill`, Bob's 400 becomes available when
+clear commits, with no payment to the issuer and no delivery to Bob. The script
+also checks this flow with Alice's custodied accounts.
+
+An empty or entirely ineligible round records zero sales at reserve. Both
+factories receive empty movement lists and finalize the issuer's allocations
+alongside any accepted bid allocations. All reserved inventory and payments
+return to their original accounts, and outcomes have no recovery tickets.
+Configured application approval still covers the full reference and empty leg
+sets. Empty sides add no transfer authorization to the batch. They are not
+zero-amount legs, which the registry rejects.
 
 ### Rollback and retry
 
@@ -575,6 +585,11 @@ but omits the token account context. The cash factory runs, then the token facto
 fails. The ledger restores the closed round, accepted bid, all four allocations
 and the approval, with no committed proceeds or outcome. Supplying the token
 context allows the same closed round to clear.
+
+`noWinners` checks the same rollback when every accepted bid is excluded by
+revocation or expiry. A token-registry failure restores the payments refunded
+by the cash batch, the allocations, and the approval. The successful retry
+returns all payments and inventory without a separate recovery transaction.
 
 `BatchApproval` is an application-level check. The upstream Splice test token
 has no OpenZeppelin D1/D2 extensions. See
@@ -597,7 +612,6 @@ has no OpenZeppelin D1/D2 extensions. See
 | A clear definitively fails before the deadline | Retry the complete accepted set with valid current context and evidence. |
 | A submission times out with an uncertain result | Reconcile command completion and ledger state before retrying. |
 | Settlement time expires or the operator cancels the round | Record `EndedRound` and recover each bid and the issuer allocations separately. |
-| A bid receives zero fill | Record its outcome and separately cancel its funding and receipt approvals through its recovery ticket. |
 
 ### Recover through the operator
 
@@ -631,8 +645,8 @@ TX  ao -> Recovery Grant.CloseUnsettledSupply(ended)
 TX  ao -> Recovery Grant.Release(ticket, current supply, current proceeds)
 ```
 
-A zero-fill outcome already references its recovery ticket. Abandoning a funded
-proposal likewise creates a ticket covering inventory and proceeds receipt.
+Abandoning a funded proposal or immediate prepared bid also creates a ticket
+covering its sending and receiving allocations.
 Cancelling an unfunded receipt approval invalidates permission without moving
 assets. Ticket release cancels the pair atomically. Different tickets can recover
 in separate transactions, so another bidder's unavailable account need not
@@ -655,6 +669,10 @@ clears using its active successor with `numIterations = 0`. The
 `allocationReuseGuard` script changes both payment and receipt IDs and checks
 that neither can be assigned to another bid. Other registry lifecycles need a
 verified stable root or additional authenticated lineage evidence.
+
+`custodyRecoverySuccessor` checks these ID changes after round cancellation.
+It rejects stale IDs, releases the active allocations through their ticket, and
+rejects a second release.
 
 Abandoned `BidRequest` and `RoundFundingRequest` allocations are released
 through registry withdrawal. Pending instructions can be withdrawn by their
@@ -736,10 +754,10 @@ production load testing remain implementation decisions outside this prototype.
 | [Opening](scripts/daml/Flows/Opening.daml) | Immediate and custody round funding, both mixed states, fixed roots, one opening and preparation pause. |
 | [Funding](scripts/daml/Flows/Funding.daml) | Issuer authority, insufficient holdings, second-registry rollback, consumed inputs and funding cutoff. |
 | [Bidding](scripts/daml/Flows/Bidding.daml) | Immediate bidder creation, authorization, preparation pause, batch admission and numbering. |
-| [Clearing](scripts/daml/Flows/Clearing.daml) | Complete result, exact payments, deliveries, refunds and empty rounds. |
+| [Clearing](scripts/daml/Flows/Clearing.daml) | Complete result, payments, deliveries, zero-fill refunds, empty rounds, and rollback and retry with no winners. |
 | [Iterated](scripts/daml/Flows/Iterated.daml) | Custody instructions, receipt approval, allocation reuse, round references, refunds, rollover and active successors. |
 | [Controls](scripts/daml/Flows/Controls.daml) | Credential revocation, missing allocations, application approval, rollback and admission pause. |
-| [Recovery](scripts/daml/Flows/Recovery.daml) | Abandoned round and bid requests, instruction withdrawal, late admission, missed settlement and zero fills. |
+| [Recovery](scripts/daml/Flows/Recovery.daml) | Abandoned requests, instruction withdrawal, late admission, missed settlement, and successor checks after cancellation. |
 | [Authority](scripts/daml/Flows/Authority.daml) | Operator restrictions and the direct-`av` counterexample. |
 | [Audit](scripts/daml/Flows/Audit.daml) | Accepted membership, outcomes and proceeds. |
 | [Math](scripts/daml/Flows/Math.daml) | Price bands, proportional lots, exclusions and rounding. |

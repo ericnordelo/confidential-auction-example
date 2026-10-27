@@ -15,8 +15,8 @@ For a complete auction from opening to settlement, read `happyPath` in [Clearing
 | [Opening](scripts/daml/Flows/Opening.daml) | Immediate and custody round funding, mixed readiness, opening and preparation pause |
 | [Funding](scripts/daml/Flows/Funding.daml) | Issuer authority, insufficient funds and atomic funding or bid-creation rollback |
 | [Bidding](scripts/daml/Flows/Bidding.daml) | Immediate bidder creation, authorization and batch acceptance |
-| [Clearing](scripts/daml/Flows/Clearing.daml) | Result calculation, payments and token delivery |
-| [Recovery](scripts/daml/Flows/Recovery.daml) | Abandoned round and bid requests, registry withdrawal, missed deadlines and zero fills |
+| [Clearing](scripts/daml/Flows/Clearing.daml) | Payments, delivery, zero-fill refunds and rounds with no winners |
+| [Recovery](scripts/daml/Flows/Recovery.daml) | Abandoned requests, registry withdrawal, missed deadlines and cancelled rounds |
 | [Controls](scripts/daml/Flows/Controls.daml) | Eligibility, cancelled allocations, settlement approval, rollback and pause |
 | [Iterated](scripts/daml/Flows/Iterated.daml) | Splice funding and receipt allocations, custody approval, mixed readiness, refunds, rollover and admission guards |
 | [Authority](scripts/daml/Flows/Authority.daml) | Operator restrictions and the trust placed in `av` |

@@ -52,7 +52,7 @@ validationPartyTrustBoundary = do
   (issuerCash, _) <- submit (actAs t.av <> discloseMany e.disclosures) do
     exerciseCmd r.sale FinalizeSale with
       current = supply; receipt; price = 8.0
-      payments = [paymentLeg t b fill]; deliveries = [deliveryLeg t b fill]; cashArgs = cashContext e; tokenArgs = tokenContext e
+      payments = [paymentLeg t b fill]; deliveries = [deliveryLeg t b fill]
   _ <- submit (actAs t.av <> discloseMany e.disclosures) do
     exerciseCmd (toInterfaceContractId @A.SettlementFactory t.cashRules) A.SettlementFactory_SettleBatch with
       settlement = settlementFor t r.roundId

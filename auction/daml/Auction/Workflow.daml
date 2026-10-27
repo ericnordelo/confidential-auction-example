@@ -430,7 +430,7 @@ template Round with
         -- Each child sees only its own result. The complete list remains here.
         finished <- forA (zip input.bids result.fills) $ \(e, fill) ->
           exercise e.accepted FinalizeBid with current = e.currentLock; receipt = e.currentReceipt; fill; price = result.price
-        (issuerCash, issuerToken) <- exercise sale FinalizeSale with current = input.supply; receipt = input.proceeds; price = result.price; payments; deliveries; cashArgs = input.cashArgs; tokenArgs = input.tokenArgs
+        (issuerCash, issuerToken) <- exercise sale FinalizeSale with current = input.supply; receipt = input.proceeds; price = result.price; payments; deliveries
         -- The optional application approval binds the full round reference
         -- and exact legs before either registry settles.
         forA_ terms.settlementAttester $ \attester -> do
@@ -483,17 +483,16 @@ template AcceptedBid with
           && fill.payment == paymentFor terms fill.lots price && fill.payment <= paymentFor terms bid.lots bid.maxPrice)
         _ <- checkLock lock current
         _ <- checkLock this.receipt receipt
-        (cash, token, recovery) <- if fill.lots == 0
-          then do
-            ticket <- ticketFor terms (bidParties terms bid) lock this.receipt "zero fill"
-            pure ([], [], Some ticket)
+        (cash, token) <- if fill.lots == 0
+          -- Empty sides close both allocations and refund all reserved payment.
+          then pure ([finalize current []], [finalize receipt []])
           else do
             assertMsg "excluded bid cannot win" (isNone fill.exclusion)
             -- Account consent is already carried by the two allocations.
             -- These values add exact sides; they create no new allocations.
             pure ([finalize current [senderSide (paymentLeg terms bid fill)]],
-                  [finalize receipt [receiverSide (deliveryLeg terms bid fill)]], None)
-        outcome <- create $ Outcome terms.av terms.issuer terms.ao (bidParties terms bid) roundId number fill recovery
+                  [finalize receipt [receiverSide (deliveryLeg terms bid fill)]])
+        outcome <- create $ Outcome terms.av terms.issuer terms.ao (bidParties terms bid) roundId number fill None
         pure FinalizedBid with cash; token; outcome
 
     choice CloseBidWithoutSale : ContractId Outcome
@@ -526,7 +525,7 @@ template SaleAuthority with
         ticketFor terms (issuerParties terms) lock receipt "proposal abandoned"
 
     choice FinalizeSale : ([A.FinalizedAllocation], [A.FinalizedAllocation])
-      with current : AllocationId; receipt : AllocationId; price : Decimal; payments : [A.TransferLeg]; deliveries : [A.TransferLeg]; cashArgs : ExtraArgs; tokenArgs : ExtraArgs
+      with current : AllocationId; receipt : AllocationId; price : Decimal; payments : [A.TransferLeg]; deliveries : [A.TransferLeg]
       controller terms.av
       do
         assertMsg "sale not bound" (isSome boundRound)
@@ -542,11 +541,8 @@ template SaleAuthority with
             && p.sender.owner == d.receiver.owner && p.amount == paymentFor terms lots price)
         _ <- checkLock lock current
         _ <- checkLock this.receipt receipt
-        if null payments then do
-          _ <- cancel terms.av current tokenArgs
-          _ <- cancel terms.av receipt cashArgs
-          pure ([], [])
-        else pure ([finalize receipt (map receiverSide payments)], [finalize current (map senderSide deliveries)])
+        -- With no winners, empty sides release all inventory through settlement.
+        pure ([finalize receipt (map receiverSide payments)], [finalize current (map senderSide deliveries)])
 
     choice CloseSaleWithoutSale : ContractId RecoveryTicket
       with reason : Text

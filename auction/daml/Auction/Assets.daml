@@ -85,7 +85,8 @@ finalize cid sides = A.FinalizedAllocation cid sides None
 
 settle : ContractId TokenRules -> Party -> A.SettlementInfo -> [A.TransferLeg] -> [A.FinalizedAllocation] -> ExtraArgs -> Update ()
 settle rules av settlement legs allocations args =
-  if null legs then assertMsg "allocations supplied without movements" (null allocations)
+  -- Allocations with no sides still settle and release their unused funding.
+  if null allocations then assertMsg "movements supplied without allocations" (null legs)
   else do
     assertMsg "auction allocations must end after clear" (all (isNone . (.nextIterationFunding)) allocations)
     result <- exercise (toInterfaceContractId @A.SettlementFactory rules) A.SettlementFactory_SettleBatch with

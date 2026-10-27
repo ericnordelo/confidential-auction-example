@@ -3,6 +3,9 @@ module Flows.Clearing where
 import Daml.Script
 import DA.Assert ((===))
 import DA.Foldable (forA_)
+import Splice.Testing.Tokens.TestTokenV2 (TokenAllocationV2)
+import Auction.Assets (extra)
+import Auction.Eligibility
 import Auction.Types
 import Auction.Workflow
 import Flows.Support
@@ -51,7 +54,105 @@ happyPath = do
   assertGone t.av closed
   debug "Atomic clear complete: every cash payment and token delivery committed."
 
--- No eligible demand still creates one terminal result and returns inventory.
+-- Zero-fill allocations settle in the same transaction as the winner's legs.
+-- Exercise both basic and custodied losing accounts without a recovery call.
+zeroFill : Script ()
+zeroFill = forA_ [False, True] $ \custody -> do
+  e <- setup ("zero-fill-" <> show custody) False
+  let t = e.terms
+      winnerTerms = bidTerms e (if custody then e.bob else e.alice) 10 12.0
+      loserTerms = bidTerms e (if custody then e.alice else e.bob) 5 8.0
+  (round, published, supply) <- openRound e
+  winner <- prepareBid e published winnerTerms
+  loser <- prepareBid e published loserTerms
+  admitted <- acceptBatch e round supply [winner,loser]
+  closed <- closeRound e admitted
+  input <- clearInput e closed supply [winner,loser]
+  input.proposed === Result 12.0 [Fill 0 10 1200.0 None, Fill 1 0 0.0 None]
+  _ <- clearRound e closed input
+
+  [(_, outcome)] <- query @Outcome loserTerms.bidder
+  outcome.fill === Fill 1 0 0.0 None
+  outcome.recovery === None
+  balance loserTerms.bidder loserTerms.payment t.cashInstrument False >>= (=== 400.0)
+  balance loserTerms.bidder loserTerms.payment t.cashInstrument True >>= (=== 0.0)
+  balance loserTerms.bidder loserTerms.delivery t.tokenInstrument False >>= (=== 0.0)
+  balance winnerTerms.bidder winnerTerms.delivery t.tokenInstrument False >>= (=== 100.0)
+  balance t.issuer t.proceeds t.cashInstrument False >>= (=== 1200.0)
+  query @TokenAllocationV2 t.av >>= (\xs -> length xs === 0)
+  query @RecoveryTicket t.av >>= (\xs -> length xs === 0)
+  query @AcceptedBid t.av >>= (\xs -> length xs === 0)
+  assertGone t.av closed
+
+-- Both registries receive allocations with empty movement lists. A late
+-- registry failure must roll back refunds as well as outcomes and approval.
+noWinners : Script ()
+noWinners = do
+  e <- setup "no-winners" True
+  let t = e.terms
+      aliceTerms = bidTerms e e.alice 5 12.0
+      bobTerms = bidTerms e e.bob 3 10.0
+  (round, published, supply) <- openRound e
+  alice <- prepareBid e published aliceTerms
+  bob <- prepareBid e published bobTerms
+  admitted <- acceptBatch e round supply [alice,bob]
+  revoked <- submit t.eligibilityProvider do
+    exerciseCmd alice.credential UpdateStatus with newExpiry = t.settlementDeadline; newRevoked = True
+  expired <- submit t.eligibilityProvider do
+    exerciseCmd bob.credential UpdateStatus with newExpiry = t.biddingDeadline; newRevoked = False
+  closed <- closeRound e admitted
+  Some r <- queryContractId t.av closed
+  input <- clearInput e closed supply [(alice with credential = revoked), (bob with credential = expired)]
+  input.proposed === Result 8.0
+    [Fill 0 0 0.0 (Some "credential revoked"), Fill 1 0 0.0 (Some "credential expired")]
+
+  -- Empty movement sets still need the configured application's approval.
+  e <- withRegistryDisclosures e
+  submitMustFail (actAs t.ao <> readAs t.av <> discloseMany e.disclosures) do
+    exerciseCmd (grant e Clearing) ClearRound with round = closed; input
+  approval <- submit e.attester do
+    createCmd $ BatchApproval e.attester (settlementFor t r.roundId) [] [] t.settlementDeadline
+  let approved = input with approval = Some approval
+  submitMustFail (actAs t.ao <> readAs t.av <> discloseMany e.disclosures) do
+    exerciseCmd (grant e Clearing) ClearRound with round = closed; input = approved with tokenArgs = extra
+  assertActive t.av closed
+  assertActive t.av r.sale
+  assertActive t.av approval
+  forA_ r.accepted (assertActive t.av)
+  forA_ [supply, r.proceedsReceipt.root, alice.currentLock, alice.currentReceipt, bob.currentLock, bob.currentReceipt] $ \cid ->
+    assertActive t.av (fromInterfaceContractId @TokenAllocationV2 cid)
+  forA_ [(aliceTerms,600.0),(bobTerms,300.0)] $ \(bid, reserved) -> do
+    balance bid.bidder bid.payment t.cashInstrument False >>= (=== 0.0)
+    balance bid.bidder bid.payment t.cashInstrument True >>= (=== reserved)
+  balance t.issuer t.inventory t.tokenInstrument True >>= (=== 100.0)
+  query @Outcome t.av >>= (\xs -> length xs === 0)
+  query @RecoveryTicket t.av >>= (\xs -> length xs === 0)
+
+  -- A retry releases every payment and all inventory without cancellation.
+  cleared <- clearRound e closed approved
+  Some result <- queryContractId t.av cleared
+  result.result === input.proposed
+  length result.outcomes === 2
+  forA_ result.outcomes $ \cid -> do
+    Some outcome <- queryContractId t.av cid
+    outcome.recovery === None
+  forA_ [(aliceTerms,600.0),(bobTerms,300.0)] $ \(bid, reserved) -> do
+    balance bid.bidder bid.payment t.cashInstrument False >>= (=== reserved)
+    balance bid.bidder bid.payment t.cashInstrument True >>= (=== 0.0)
+    balance bid.bidder bid.delivery t.tokenInstrument False >>= (=== 0.0)
+  balance t.issuer t.inventory t.tokenInstrument False >>= (=== 100.0)
+  balance t.issuer t.inventory t.tokenInstrument True >>= (=== 0.0)
+  balance t.issuer t.proceeds t.cashInstrument False >>= (=== 0.0)
+  query @TokenAllocationV2 t.av >>= (\xs -> length xs === 0)
+  query @RecoveryTicket t.av >>= (\xs -> length xs === 0)
+  query @AcceptedBid t.av >>= (\xs -> length xs === 0)
+  assertGone t.av closed
+  assertGone t.av r.sale
+  assertGone t.av approval
+  submitMustFail (actAs t.ao <> readAs t.av <> discloseMany e.disclosures) do
+    exerciseCmd (grant e Clearing) ClearRound with round = closed; input = approved
+
+-- Even without accepted bids, settle both issuer allocations with empty sides.
 emptyRound : Script ()
 emptyRound = do
   e <- setup "empty" False
@@ -64,3 +165,9 @@ emptyRound = do
   Some c <- queryContractId e.terms.av cleared
   c.result === Result e.terms.reserve []
   balance e.terms.issuer e.terms.inventory e.terms.tokenInstrument False >>= (=== 100.0)
+  balance e.terms.issuer e.terms.inventory e.terms.tokenInstrument True >>= (=== 0.0)
+  balance e.terms.issuer e.terms.proceeds e.terms.cashInstrument False >>= (=== 0.0)
+  query @TokenAllocationV2 e.terms.av >>= (\xs -> length xs === 0)
+  query @RecoveryTicket e.terms.av >>= (\xs -> length xs === 0)
+  assertGone e.terms.av closed
+  assertGone e.terms.av initialRound.sale
