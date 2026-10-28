@@ -12,7 +12,7 @@ import Auction.Workflow
 import Flows.Support
 
 -- Abandoning an entirely pending round request leaves cleanup in the registries.
--- The issuer withdraws both instructions without provider or operator submission.
+-- The seller withdraws both instructions without provider or operator submission.
 pendingRoundFundingWithdrawal : Script ()
 pendingRoundFundingWithdrawal = do
   e <- setup "pending-round-withdrawal" False
@@ -24,16 +24,16 @@ pendingRoundFundingWithdrawal = do
   Some pending <- queryContractId t.av request
   F.AllocationInstructionResult_Pending inventory <- pure pending.inventory
   F.AllocationInstructionResult_Pending receipt <- pure pending.receipt
-  submit t.issuer do exerciseCmd request AbandonRoundFunding
+  submit t.seller do exerciseCmd request AbandonRoundFunding
   forA_ [(inventory,tokenContext e),(receipt,cashContext e)] $ \(instruction,args) -> do
-    result <- submit (actAs t.issuer <> discloseMany e.staticDisclosures) do
-      exerciseCmd instruction F.AllocationInstruction_Withdraw with actors = [t.issuer]; extraArgs = args
+    result <- submit (actAs t.seller <> discloseMany e.staticDisclosures) do
+      exerciseCmd instruction F.AllocationInstruction_Withdraw with actors = [t.seller]; extraArgs = args
     result.output === F.AllocationInstructionResult_Failed
   assertGone t.av request
   query @RecoveryTicket t.av >>= (\xs -> length xs === 0)
   query @Round t.av >>= (\xs -> length xs === 0)
-  balance t.issuer t.inventory t.tokenInstrument False >>= (=== 100.0)
-  balance t.issuer t.inventory t.tokenInstrument True >>= (=== 0.0)
+  balance t.seller t.inventory t.tokenInstrument False >>= (=== 100.0)
+  balance t.seller t.inventory t.tokenInstrument True >>= (=== 0.0)
 
 -- A completed inventory allocation remains committed after request abandonment.
 -- Registry withdrawal releases it at the deadline, with no auction recovery ticket.
@@ -49,18 +49,18 @@ mixedRoundFundingWithdrawal = do
   Some pending <- queryContractId t.av request
   F.AllocationInstructionResult_Completed supply <- pure pending.inventory
   F.AllocationInstructionResult_Pending receipt <- pure pending.receipt
-  submit t.issuer do exerciseCmd request AbandonRoundFunding
-  _ <- submit (actAs t.issuer <> discloseMany e.staticDisclosures) do
-    exerciseCmd receipt F.AllocationInstruction_Withdraw with actors = [t.issuer]; extraArgs = cashContext e
+  submit t.seller do exerciseCmd request AbandonRoundFunding
+  _ <- submit (actAs t.seller <> discloseMany e.staticDisclosures) do
+    exerciseCmd receipt F.AllocationInstruction_Withdraw with actors = [t.seller]; extraArgs = cashContext e
   e <- withRegistryDisclosures e
-  submitMustFail (actAs t.issuer <> discloseMany e.disclosures) do
-    exerciseCmd supply A.Allocation_Withdraw with actors = [t.issuer]; extraArgs = tokenContext e
-  balance t.issuer t.inventory t.tokenInstrument True >>= (=== 100.0)
+  submitMustFail (actAs t.seller <> discloseMany e.disclosures) do
+    exerciseCmd supply A.Allocation_Withdraw with actors = [t.seller]; extraArgs = tokenContext e
+  balance t.seller t.inventory t.tokenInstrument True >>= (=== 100.0)
   setTime (addRelTime t.settlementDeadline (seconds 1))
-  result <- submit (actAs t.issuer <> discloseMany e.disclosures) do
-    exerciseCmd supply A.Allocation_Withdraw with actors = [t.issuer]; extraArgs = tokenContext e
+  result <- submit (actAs t.seller <> discloseMany e.disclosures) do
+    exerciseCmd supply A.Allocation_Withdraw with actors = [t.seller]; extraArgs = tokenContext e
   result.output === A.AllocationResult_Withdrawn
-  balance t.issuer t.inventory t.tokenInstrument False >>= (=== 100.0)
+  balance t.seller t.inventory t.tokenInstrument False >>= (=== 100.0)
   assertGone t.av (fromInterfaceContractId @TokenAllocationV2 supply)
   query @RecoveryTicket t.av >>= (\xs -> length xs === 0)
 
@@ -169,7 +169,7 @@ missedSettlement = do
   _ <- releaseTicket e supplyTicket supply receipt
   balance e.alice (bidTerms e e.alice 5 12.0).payment e.terms.cashInstrument False >>= (=== 600.0)
   balance e.bob (bidTerms e e.bob 8 10.0).payment e.terms.cashInstrument False >>= (=== 800.0)
-  balance e.terms.issuer e.terms.inventory e.terms.tokenInstrument False >>= (=== 100.0)
+  balance e.terms.seller e.terms.inventory e.terms.tokenInstrument False >>= (=== 100.0)
 
 -- A committed allocation blocks account withdrawal before its deadline.
 -- After the deadline, the account parties can recover without operator action.

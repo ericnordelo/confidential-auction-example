@@ -49,7 +49,7 @@ validationPartyTrustBoundary = do
   -- These are separate submissions by av. They intentionally bypass Round_Clear.
   finalized <- submit (actAs t.av <> discloseMany e.disclosures) do
     exerciseCmd (head r.accepted) FinalizeBid with current = bid.currentLock; receipt = bid.currentReceipt; fill; price = 8.0
-  (issuerCash, _) <- submit (actAs t.av <> discloseMany e.disclosures) do
+  (sellerCash, _) <- submit (actAs t.av <> discloseMany e.disclosures) do
     exerciseCmd r.sale FinalizeSale with
       current = supply; receipt; price = 8.0
       payments = [paymentLeg t b fill]; deliveries = [deliveryLeg t b fill]
@@ -57,9 +57,9 @@ validationPartyTrustBoundary = do
     exerciseCmd (toInterfaceContractId @A.SettlementFactory t.cashRules) A.SettlementFactory_SettleBatch with
       settlement = settlementFor t r.roundId
       transferLegs = [paymentLeg t b fill]
-      allocations = finalized.cash <> issuerCash
+      allocations = finalized.cash <> sellerCash
       actors = [t.av]; extraArgs = cashContext e
-  balance t.issuer t.proceeds t.cashInstrument False >>= (=== 400.0)
+  balance t.seller t.proceeds t.cashInstrument False >>= (=== 400.0)
   balance e.alice b.delivery t.tokenInstrument False >>= (=== 0.0)
   assertActive t.av r1
   debug "COUNTEREXAMPLE: privileged av settled cash without token delivery."

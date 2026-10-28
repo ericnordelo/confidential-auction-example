@@ -70,8 +70,8 @@ preparedAllocationsAndRefunds = do
   -- Fifty tokens sell at reserve 8. The locked 600 pays 400 and refunds 200.
   balance e.alice b.payment t.cashInstrument False >>= (=== 200.0)
   balance e.alice b.delivery t.tokenInstrument False >>= (=== 50.0)
-  balance t.issuer t.inventory t.tokenInstrument False >>= (=== 50.0)
-  balance t.issuer t.proceeds t.cashInstrument False >>= (=== 400.0)
+  balance t.seller t.inventory t.tokenInstrument False >>= (=== 50.0)
+  balance t.seller t.proceeds t.cashInstrument False >>= (=== 400.0)
   forA_ [bid.currentLock, bid.currentReceipt, supply, r.proceedsReceipt.root] $ \cid ->
     assertGone t.av (fromInterfaceContractId @TokenAllocationV2 cid)
   query @TokenAllocationV2 t.av >>= (\xs -> length xs === 0)
@@ -100,7 +100,7 @@ receiptGuards = do
   submitMustFail (actAs e.terms.ao <> readAs e.terms.av <> discloseMany e.disclosures) do
     exerciseCmd (grant e Clearing) ClearRound with round = closed; input
   assertActive e.terms.av closed
-  balance e.terms.issuer e.terms.proceeds e.terms.cashInstrument False >>= (=== 0.0)
+  balance e.terms.seller e.terms.proceeds e.terms.cashInstrument False >>= (=== 0.0)
 
 -- One Alice submission creates both pending instructions and the signed bid.
 -- Providers approve only registry contracts. Each incomplete side blocks admission.

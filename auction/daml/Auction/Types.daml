@@ -8,13 +8,12 @@ import DA.List (dedupSort, sortOn)
 import Splice.Api.Token.HoldingV2 qualified as H
 import Splice.Api.Token.AllocationV2 qualified as A
 import Splice.Api.Token.MetadataV1
-import Splice.TokenStandard.Utils (accountParties)
 import Splice.Testing.Tokens.TestTokenV2 (TokenRules)
 
 -- Fixed terms are copied into each consent contract. Account consent cannot
 -- be redirected later by changing an argument on an operator choice.
 data Terms = Terms with
-    issuer : Party
+    seller : Party
     av : Party
     ao : Party
     eligibilityProvider : Party
@@ -65,12 +64,6 @@ data Result = Result with
     fills : [Fill]
   deriving (Eq, Show)
 
-issuerParties : Terms -> [Party]
-issuerParties t = dedupSort (t.issuer :: accountParties t.tokenAdmin t.inventory <> accountParties t.cashAdmin t.proceeds)
-
-bidParties : Terms -> BidTerms -> [Party]
-bidParties t b = dedupSort (b.bidder :: accountParties t.cashAdmin b.payment <> accountParties t.tokenAdmin b.delivery)
-
 -- Ceiling is applied both to the maximum lock and to the final payment.
 paymentFor : Terms -> Int -> Decimal -> Decimal
 paymentFor t lots price = intToDecimal (ceiling (intToDecimal lots * t.lotSize * price / t.paymentQuantum)) * t.paymentQuantum
@@ -81,7 +74,7 @@ validTerms t = t.supplyLots > 0 && t.supplyLots <= 1000000
   && t.reserve > 0.0 && t.reserve <= 1000000.0
   && t.priceTick >= 0.000001 && t.paymentQuantum >= 0.000001
   && t.reserve / t.priceTick == intToDecimal (ceiling (t.reserve / t.priceTick))
-  && t.inventory.owner == Some t.issuer && t.proceeds.owner == Some t.issuer
+  && t.inventory.owner == Some t.seller && t.proceeds.owner == Some t.seller
   && t.biddingDeadline < t.settlementDeadline
   && t.maxBids > 0 && t.maxBids <= 64
   && t.maxBatch > 0 && t.maxBatch <= t.maxBids
@@ -89,7 +82,7 @@ validTerms t = t.supplyLots > 0 && t.supplyLots <= 1000000
 
 validBid : Terms -> BidTerms -> Bool
 validBid t b = b.payment.owner == Some b.bidder && b.delivery.owner == Some b.bidder
-  && b.bidder /= t.issuer
+  && b.bidder /= t.seller
   && b.lots > 0 && b.lots <= 1000000
   && b.maxPrice >= t.reserve && b.maxPrice <= 1000000.0
   && b.maxPrice / t.priceTick == intToDecimal (ceiling (b.maxPrice / t.priceTick))

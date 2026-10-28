@@ -38,7 +38,7 @@ auditResult = do
   map (\o -> o.fill.lots) outcomes === [5,4,1]
   aggregate.result.price === 10.0
   sum (map (\o -> o.fill.payment) outcomes) === 1000.0
-  balance t.issuer t.proceeds t.cashInstrument False >>= (=== 1000.0)
+  balance t.seller t.proceeds t.cashInstrument False >>= (=== 1000.0)
 
   -- The eligibility provider cannot query the private book or outcomes.
   query @AcceptedBid t.eligibilityProvider >>= (\xs -> length xs === 0)

@@ -1,0 +1,210 @@
+-- Providers approve assets through registry contracts without reading bids.
+module Flows.Privacy where
+
+import Daml.Script
+import DA.Assert ((===))
+import DA.Foldable (forA_)
+import DA.Optional (isNone)
+import Splice.Api.Token.AllocationInstructionV2 qualified as F
+import Splice.Testing.Tokens.TestTokenV2
+import Auction.Types
+import Auction.Workflow
+import Flows.Support
+
+-- Use known, active IDs: an empty query after archival would prove nothing.
+-- Check both contract lookup and the party's contract-disclosure API.
+assertHidden : (Template t, HasEnsure t) => Party -> ContractId t -> Script ()
+assertHidden party cid = do
+  found <- queryContractId party cid
+  assertMsg "private contract is visible" (isNone found)
+  disclosure <- queryDisclosure party cid
+  assertMsg "private contract is disclosable" (isNone disclosure)
+
+assertSourceHidden : Party -> BidSource -> Script ()
+assertSourceHidden party source = case source of
+  FundedBid cid -> assertHidden party cid
+  RegistryPreparedBid cid -> assertHidden party cid
+
+-- Registry instructions and completed allocations stay visible to their provider.
+assertRegistryVisible : Party -> F.AllocationInstructionResult_Output -> Script ()
+assertRegistryVisible provider output = case output of
+  F.AllocationInstructionResult_Pending cid ->
+    assertActive provider (fromInterfaceContractId @TokenAllocationInstructionV2 cid)
+  F.AllocationInstructionResult_Completed cid ->
+    assertActive provider (fromInterfaceContractId @TokenAllocationV2 cid)
+  F.AllocationInstructionResult_Failed -> abort "allocation request failed"
+
+-- Run with and without fresh custody approval, and with a winning or losing bid.
+-- The seller and Alice have different providers. Bob uses basic accounts.
+providerVisibilityFlow : Bool -> Bool -> Script ()
+providerVisibilityFlow pending zeroFill = do
+  e <- setupWithProviderPolicy (PartyConfig True pending) allocateParty
+    ("privacy-" <> show pending <> "-" <> show zeroFill) False
+  let t = e.terms
+      aliceTerms = bidTerms e e.alice 5 (if zeroFill then 8.0 else 12.0)
+      bobTerms = bidTerms e e.bob 10 (if zeroFill then 12.0 else 8.0)
+      providers = [e.aliceProvider, e.sellerProvider]
+  preparation <- submit (actAs t.ao <> readAs t.av) do
+    exerciseCmd (grant e Preparation) StartRound with terms = t
+  assertActive t.seller preparation
+  forA_ providers $ \provider -> assertHidden provider preparation
+  (inventory, _) <- mint e False t.inventory 100.0
+  source <- submitRoundFunding e preparation [inventory]
+  case source of
+    FundedRound cid -> do
+      pending === False
+      forA_ providers $ \provider -> assertHidden provider cid
+    RegistryPreparedRound cid -> do
+      pending === True
+      Some request <- queryContractId t.seller cid
+      forA_ providers $ \provider -> assertHidden provider cid
+      forA_ [request.inventory, request.receipt] (assertRegistryVisible e.sellerProvider)
+  -- These approvals receive registry context, never the auction funding request.
+  (supply, proceeds) <- completeRoundFunding e source
+  forA_ [supply, proceeds] $ \cid -> do
+    assertActive e.sellerProvider (fromInterfaceContractId @TokenAllocationV2 cid)
+    assertHidden e.aliceProvider (fromInterfaceContractId @TokenAllocationV2 cid)
+  (round, published) <- submit (actAs t.ao <> readAs t.av) do
+    exerciseCmd (grant e Opening) OpenRound with source; supply; receipt = proceeds
+  Some r <- queryContractId t.av round
+  assertActive t.seller r.sale
+  forA_ providers $ \provider -> do
+    assertHidden provider round
+    assertHidden provider r.sale
+
+  (cash, _) <- mint e True aliceTerms.payment (paymentFor t aliceTerms.lots aliceTerms.maxPrice)
+  bidSource <- submitBid e published aliceTerms [cash]
+  forA_ (e.bob :: providers) $ \party -> assertSourceHidden party bidSource
+  case bidSource of
+    FundedBid cid -> do
+      pending === False
+      assertActive e.alice cid
+    RegistryPreparedBid cid -> do
+      pending === True
+      Some request <- queryContractId e.alice cid
+      forA_ [request.payment, request.receipt] (assertRegistryVisible e.aliceProvider)
+  (payment, receipt) <- completeBid e bidSource
+  forA_ [payment, receipt] $ \cid -> do
+    assertActive e.aliceProvider (fromInterfaceContractId @TokenAllocationV2 cid)
+    assertHidden e.sellerProvider (fromInterfaceContractId @TokenAllocationV2 cid)
+  credential <- issueCredential e e.alice
+  let alice = AdmissionInput bidSource payment receipt credential
+  bob <- prepareBid e published bobTerms
+  forA_ providers $ \provider -> assertSourceHidden provider bob.prepared
+  admitted <- acceptBatch e round supply [alice, bob]
+  Some book <- queryContractId t.av admitted
+  forA_ (zip [e.alice, e.bob] book.accepted) $ \(bidder, cid) -> do
+    forA_ [bidder, t.seller, t.av, t.ao] $ \party -> assertActive party cid
+    forA_ providers $ \provider -> assertHidden provider cid
+    assertHidden (if bidder == e.alice then e.bob else e.alice) cid
+  forA_ providers $ \provider -> assertHidden provider admitted
+
+  closed <- closeRound e admitted
+  input <- clearInput e closed supply [alice, bob]
+  cleared <- clearRound e closed input
+  Some result <- queryContractId t.av cleared
+  let alicePayment = if zeroFill then 0.0 else 400.0
+      aliceTokens = if zeroFill then 0.0 else 50.0
+      aliceRefund = if zeroFill then 400.0 else 200.0
+  result.result === Result (if zeroFill then 12.0 else 8.0)
+    [ Fill 0 (if zeroFill then 0 else 5) alicePayment None
+    , Fill 1 (if zeroFill then 10 else 5) (if zeroFill then 1200.0 else 400.0) None
+    ]
+  forA_ (zip [e.alice, e.bob] result.outcomes) $ \(bidder, cid) -> do
+    forA_ [bidder, t.seller, t.av, t.ao] $ \party -> assertActive party cid
+    forA_ providers $ \provider -> assertHidden provider cid
+    assertHidden (if bidder == e.alice then e.bob else e.alice) cid
+  forA_ providers $ \provider -> assertHidden provider cleared
+  -- Providers still see their accounts' payouts and refunds after settlement.
+  forA_ [e.alice, e.aliceProvider] $ \party -> do
+    balance party aliceTerms.payment t.cashInstrument False >>= (=== aliceRefund)
+    balance party aliceTerms.delivery t.tokenInstrument False >>= (=== aliceTokens)
+    balance party aliceTerms.payment t.cashInstrument True >>= (=== 0.0)
+  forA_ [t.seller, e.sellerProvider] $ \party -> do
+    balance party t.proceeds t.cashInstrument False >>= (=== (if zeroFill then 1200.0 else 800.0))
+    balance party t.inventory t.tokenInstrument True >>= (=== 0.0)
+  query @RecoveryTicket t.av >>= (\xs -> length xs === 0)
+  query @TokenAllocationV2 t.av >>= (\xs -> length xs === 0)
+
+-- Both round funding and bidding wait for provider approval in registry contracts.
+custodianVisibility : Script ()
+custodianVisibility = forA_ [False, True] (providerVisibilityFlow True)
+
+-- Providers authorize immediate allocation through their existing account policy.
+immediateProviderVisibility : Script ()
+immediateProviderVisibility = forA_ [False, True] (providerVisibilityFlow False)
+
+-- Check the ticket while active, before testing that its recovery succeeds.
+assertPrivateTicket : Env -> Party -> ContractId RecoveryTicket -> Script ()
+assertPrivateTicket e owner ticket = do
+  forA_ [owner, e.terms.ao, e.terms.av] $ \party -> assertActive party ticket
+  forA_ [e.aliceProvider, e.sellerProvider, e.outsider] $ \party -> assertHidden party ticket
+
+-- Cancellation and expiry recover both sides without provider ticket access.
+-- Exercise immediate and staged allocation approval with real provider accounts.
+recoveryVisibility : Script ()
+recoveryVisibility = forA_ [False, True] $ \pending -> forA_ [False, True] $ \expired -> do
+  e <- setupWithProviderPolicy (PartyConfig True pending) allocateParty
+    ("privacy-recovery-" <> show pending <> "-" <> show expired) False
+  let t = e.terms
+      terms = bidTerms e e.alice 5 12.0
+  (round, published, supply) <- openRound e
+  bid <- prepareBid e published terms
+  admitted <- acceptBatch e round supply [bid]
+  Some r <- queryContractId t.av admitted
+  [accepted] <- pure r.accepted
+  if expired then setTime t.settlementDeadline else pure ()
+  ended <- submit (actAs t.ao <> readAs t.av) do
+    exerciseCmd (grant e Termination) EndRound with
+      round = admitted; expired
+      reason = if expired then "settlement deadline reached" else "venue cancelled"
+  outcomeCid <- submit (actAs t.ao <> readAs t.av) do
+    exerciseCmd (grant e Recovery) CloseUnsettledBid with ended; bid = accepted
+  Some outcome <- queryContractId e.alice outcomeCid
+  Some ticket <- pure outcome.recovery
+  assertHidden e.aliceProvider outcomeCid
+  assertHidden e.sellerProvider outcomeCid
+  assertPrivateTicket e e.alice ticket
+  forA_ [bid.currentLock, bid.currentReceipt] $ \cid ->
+    assertActive e.aliceProvider (fromInterfaceContractId @TokenAllocationV2 cid)
+  _ <- releaseTicket e ticket bid.currentLock bid.currentReceipt
+  forA_ [e.alice, e.aliceProvider] $ \party ->
+    balance party terms.payment t.cashInstrument False >>= (=== 600.0)
+  forA_ [e.alice, t.ao, t.av] $ \party -> assertGone party ticket
+  forA_ [bid.currentLock, bid.currentReceipt] $ \cid ->
+    assertGone e.aliceProvider (fromInterfaceContractId @TokenAllocationV2 cid)
+  supplyTicket <- submit (actAs t.ao <> readAs t.av) do
+    exerciseCmd (grant e Recovery) CloseUnsettledSupply with ended
+  assertPrivateTicket e t.seller supplyTicket
+  forA_ [supply, r.proceedsReceipt.root] $ \cid ->
+    assertActive e.sellerProvider (fromInterfaceContractId @TokenAllocationV2 cid)
+  _ <- releaseTicket e supplyTicket supply r.proceedsReceipt.root
+  forA_ [t.seller, e.sellerProvider] $ \party ->
+    balance party t.inventory t.tokenInstrument False >>= (=== 100.0)
+  forA_ [t.seller, t.ao, t.av] $ \party -> assertGone party supplyTicket
+  forA_ [supply, r.proceedsReceipt.root] $ \cid ->
+    assertGone e.sellerProvider (fromInterfaceContractId @TokenAllocationV2 cid)
+
+-- Abandoned proposals and unaccepted bids use the same private ticket model.
+abandonmentTicketVisibility : Script ()
+abandonmentTicketVisibility = do
+  e <- setupWithProviderPolicy (PartyConfig True False) allocateParty "privacy-abandonment" False
+  let t = e.terms
+      terms = bidTerms e e.alice 5 12.0
+  (FundedRound proposal, supply, receipt) <- prepareRound e
+  supplyTicket <- submit t.seller do exerciseCmd proposal AbandonProposal
+  assertPrivateTicket e t.seller supplyTicket
+  _ <- releaseTicket e supplyTicket supply receipt
+  forA_ [t.seller, e.sellerProvider] $ \party ->
+    balance party t.inventory t.tokenInstrument False >>= (=== 100.0)
+  assertGone t.av supplyTicket
+
+  (_, published, _) <- openRound e
+  bid <- prepareBid e published terms
+  FundedBid prepared <- pure bid.prepared
+  ticket <- submit e.alice do exerciseCmd prepared WithdrawPreparedBid
+  assertPrivateTicket e e.alice ticket
+  _ <- releaseTicket e ticket bid.currentLock bid.currentReceipt
+  forA_ [e.alice, e.aliceProvider] $ \party ->
+    balance party terms.payment t.cashInstrument False >>= (=== 600.0)
+  assertGone t.av ticket

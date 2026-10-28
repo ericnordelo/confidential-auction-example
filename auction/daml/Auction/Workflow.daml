@@ -117,18 +117,18 @@ before deadline = do
   now <- getTime
   assertMsg "deadline reached" (now < deadline)
 
--- The issuer approves the terms and requests funding in one submission.
+-- The seller approves the terms and requests funding in one submission.
 -- Account providers approve only the registry's allocation instructions.
 template RoundPreparation with
     terms : Terms
   where
     signatory terms.av
-    observer terms.ao, issuerParties terms
+    observer terms.ao, terms.seller
     ensure validTerms terms
 
     choice FundRound : RoundSource
       with preparation : ContractId Grant; inputs : [ContractId H.Holding]; cashArgs : ExtraArgs; tokenArgs : ExtraArgs
-      controller terms.issuer
+      controller terms.seller
       do
         g <- fetch preparation
         checkGrant g Preparation terms
@@ -139,8 +139,8 @@ template RoundPreparation with
             inventorySpec = mkSpec terms.tokenAdmin terms.inventory terms.settlementDeadline
               (TM.fromList [(terms.tokenInstrument, intToDecimal terms.supplyLots * terms.lotSize)])
             receiptSpec = mkSpec terms.cashAdmin terms.proceeds terms.settlementDeadline TM.empty
-        inventory <- requestAllocation terms.tokenRules settlement inventorySpec inputs [terms.issuer] tokenArgs
-        receipt <- requestAllocation terms.cashRules settlement receiptSpec [] [terms.issuer] cashArgs
+        inventory <- requestAllocation terms.tokenRules settlement inventorySpec inputs [terms.seller] tokenArgs
+        receipt <- requestAllocation terms.cashRules settlement receiptSpec [] [terms.seller] cashArgs
         assertMsg "allocation request failed" (inventory.output /= F.AllocationInstructionResult_Failed && receipt.output /= F.AllocationInstructionResult_Failed)
         case (inventory.output, receipt.output) of
           (F.AllocationInstructionResult_Completed supply, F.AllocationInstructionResult_Completed proceeds) ->
@@ -149,7 +149,7 @@ template RoundPreparation with
           _ -> RegistryPreparedRound <$> create (RoundFundingRequest terms roundId inventory.output receipt.output)
 
     choice AbandonRoundPreparation : ()
-      controller terms.issuer
+      controller terms.seller
       do pure ()
 
 data RoundSource
@@ -163,13 +163,13 @@ template RoundFundingRequest with
     inventory : F.AllocationInstructionResult_Output
     receipt : F.AllocationInstructionResult_Output
   where
-    signatory terms.issuer, terms.av
-    observer terms.ao, issuerParties terms
+    signatory terms.seller, terms.av
+    observer terms.ao
     ensure validTerms terms && inventory /= F.AllocationInstructionResult_Failed && receipt /= F.AllocationInstructionResult_Failed
 
     -- Abandonment ends the auction request. Registry withdrawal releases its assets.
     choice AbandonRoundFunding : ()
-      controller terms.issuer
+      controller terms.seller
       do pure ()
 
     -- The opening grant binds completed allocations and opens in one transaction.
@@ -184,7 +184,7 @@ template RoundFundingRequest with
             (TM.fromList [(terms.tokenInstrument, intToDecimal terms.supplyLots * terms.lotSize)])) supply
         receiving <- bindAllocation settlement
           (mkSpec terms.cashAdmin terms.proceeds terms.settlementDeadline TM.empty) receipt
-        -- Preserve any side that already completed in the issuer's submission.
+        -- Preserve any side that already completed in the seller's submission.
         checkCompletedRoot inventory lock
         checkCompletedRoot this.receipt receiving
         createRoundProposal terms roundId lock receiving
@@ -207,7 +207,7 @@ template Proposal with
     lock : LockBinding
     receipt : LockBinding
   where
-    signatory terms.issuer, terms.av
+    signatory terms.seller, terms.av
     observer terms.ao
 
     choice Proposal_Open : (ContractId Round, ContractId PublishedTerms)
@@ -223,14 +223,14 @@ template Proposal with
         pure (round, published)
 
     choice AbandonProposal : ContractId RecoveryTicket
-      controller terms.issuer
+      controller terms.seller
       do exercise sale AbandonSale
 
 template PublishedTerms with
     terms : Terms
     roundId : AnyContractId
   where
-    signatory terms.issuer, terms.av
+    signatory terms.seller, terms.av
     observer terms.ao
 
     -- The bidder signs its terms and requests both allocations in one transaction.
@@ -265,7 +265,7 @@ template BidRequest with
     receipt : F.AllocationInstructionResult_Output
   where
     signatory terms.av, bid.bidder
-    observer terms.issuer, terms.ao, bidParties terms bid
+    observer terms.seller, terms.ao
     ensure validBid terms bid && payment /= F.AllocationInstructionResult_Failed && receipt /= F.AllocationInstructionResult_Failed
 
     choice AbandonBidRequest : ()
@@ -276,7 +276,7 @@ template BidRequest with
     -- Before admission the application creates no cancellation ticket for them.
     choice AcceptRegistryPrepared : ContractId AcceptedBid
       with payment : AllocationId; receipt : AllocationId; number : Int; credentialRoot : ContractId Credential
-      controller terms.issuer, terms.av
+      controller terms.seller, terms.av
       do
         before terms.biddingDeadline
         (lock, receiving) <- bindBidAllocations terms roundId bid payment receipt
@@ -301,16 +301,16 @@ template PreparedBid with
     receipt : LockBinding
   where
     signatory terms.av, bid.bidder
-    observer terms.issuer, terms.ao, bidParties terms bid
+    observer terms.seller, terms.ao
 
     choice Prepared_Accept : ContractId AcceptedBid
       with number : Int; credentialRoot : ContractId Credential
-      controller terms.issuer, terms.av
+      controller terms.seller, terms.av
       do create $ AcceptedBid terms roundId bid lock receipt number credentialRoot
 
     choice WithdrawPreparedBid : ContractId RecoveryTicket
       controller bid.bidder
-      do ticketFor terms (bidParties terms bid) lock receipt "unaccepted bid abandoned"
+      do ticketFor terms bid.bidder lock receipt "unaccepted bid abandoned"
 
 data BidSource
   = FundedBid (ContractId PreparedBid)
@@ -366,7 +366,7 @@ template Round with
     accepted : [ContractId AcceptedBid]
     nextNumber : Int
   where
-    signatory terms.issuer, terms.av
+    signatory terms.seller, terms.av
     observer terms.ao
     ensure nextNumber == length accepted && nextNumber <= terms.maxBids && length (dedupSort accepted) == length accepted
 
@@ -430,7 +430,7 @@ template Round with
         -- Each child sees only its own result. The complete list remains here.
         finished <- forA (zip input.bids result.fills) $ \(e, fill) ->
           exercise e.accepted FinalizeBid with current = e.currentLock; receipt = e.currentReceipt; fill; price = result.price
-        (issuerCash, issuerToken) <- exercise sale FinalizeSale with current = input.supply; receipt = input.proceeds; price = result.price; payments; deliveries
+        (sellerCash, sellerToken) <- exercise sale FinalizeSale with current = input.supply; receipt = input.proceeds; price = result.price; payments; deliveries
         -- The optional application approval binds the full round reference
         -- and exact legs before either registry settles.
         forA_ terms.settlementAttester $ \attester -> do
@@ -442,8 +442,8 @@ template Round with
           exercise approval VerifyBatch with expected = settlement; expectedPayments = payments; expectedDeliveries = deliveries
         -- Both registries execute inside this one parent transaction. A token
         -- factory failure rolls back even an already-executed cash factory.
-        settle terms.cashRules terms.av settlement payments (concatMap (.cash) finished <> issuerCash) input.cashArgs
-        settle terms.tokenRules terms.av settlement deliveries (concatMap (.token) finished <> issuerToken) input.tokenArgs
+        settle terms.cashRules terms.av settlement payments (concatMap (.cash) finished <> sellerCash) input.cashArgs
+        settle terms.tokenRules terms.av settlement deliveries (concatMap (.token) finished <> sellerToken) input.tokenArgs
         create $ ClearedRound terms roundId result (map (.outcome) finished)
 
     choice Round_End : ContractId EndedRound
@@ -470,8 +470,8 @@ template AcceptedBid with
     number : Int
     credentialRoot : ContractId Credential
   where
-    signatory terms.issuer, terms.av, bid.bidder
-    observer terms.ao, bidParties terms bid
+    signatory terms.seller, terms.av, bid.bidder
+    observer terms.ao
 
     choice FinalizeBid : FinalizedBid
       with current : AllocationId; receipt : AllocationId; fill : Fill; price : Decimal
@@ -492,15 +492,15 @@ template AcceptedBid with
             -- These values add exact sides; they create no new allocations.
             pure ([finalize current [senderSide (paymentLeg terms bid fill)]],
                   [finalize receipt [receiverSide (deliveryLeg terms bid fill)]])
-        outcome <- create $ Outcome terms.av terms.issuer terms.ao (bidParties terms bid) roundId number fill None
+        outcome <- create $ Outcome terms.av terms.seller terms.ao bid.bidder roundId number fill None
         pure FinalizedBid with cash; token; outcome
 
     choice CloseBidWithoutSale : ContractId Outcome
       with reason : Text
       controller terms.av
       do
-        ticket <- ticketFor terms (bidParties terms bid) lock receipt reason
-        create $ Outcome terms.av terms.issuer terms.ao (bidParties terms bid) roundId number (Fill number 0 0.0 (Some reason)) (Some ticket)
+        ticket <- ticketFor terms bid.bidder lock receipt reason
+        create $ Outcome terms.av terms.seller terms.ao bid.bidder roundId number (Fill number 0 0.0 (Some reason)) (Some ticket)
 
 template SaleAuthority with
     terms : Terms
@@ -508,8 +508,8 @@ template SaleAuthority with
     lock : LockBinding
     receipt : LockBinding
   where
-    signatory terms.av, terms.issuer
-    observer terms.ao, issuerParties terms
+    signatory terms.av, terms.seller
+    observer terms.ao
 
     choice BindSale : ContractId SaleAuthority
       with roundId : AnyContractId
@@ -522,7 +522,7 @@ template SaleAuthority with
       controller terms.av
       do
         assertMsg "sale is bound to a round" (isNone boundRound)
-        ticketFor terms (issuerParties terms) lock receipt "proposal abandoned"
+        ticketFor terms terms.seller lock receipt "proposal abandoned"
 
     choice FinalizeSale : ([A.FinalizedAllocation], [A.FinalizedAllocation])
       with current : AllocationId; receipt : AllocationId; price : Decimal; payments : [A.TransferLeg]; deliveries : [A.TransferLeg]
@@ -547,21 +547,21 @@ template SaleAuthority with
     choice CloseSaleWithoutSale : ContractId RecoveryTicket
       with reason : Text
       controller terms.av
-      do ticketFor terms (issuerParties terms) lock receipt reason
+      do ticketFor terms terms.seller lock receipt reason
 
--- The account parties keep visibility of their own outcome, not the whole book.
+-- Each bidder sees its outcome. Providers track asset changes in the registry.
 template Outcome with
     av : Party
-    issuer : Party
+    seller : Party
     ao : Party
-    parties : [Party]
+    bidder : Party
     roundId : AnyContractId
     number : Int
     fill : Fill
     recovery : Optional (ContractId RecoveryTicket)
   where
     signatory av
-    observer issuer, ao, parties
+    observer seller, ao, bidder
 
 template ClearedRound with
     terms : Terms
@@ -569,7 +569,7 @@ template ClearedRound with
     result : Result
     outcomes : [ContractId Outcome]
   where
-    signatory terms.issuer, terms.av
+    signatory terms.seller, terms.av
     observer terms.ao
 
 template EndedRound with
@@ -579,7 +579,7 @@ template EndedRound with
     accepted : [ContractId AcceptedBid]
     reason : Text
   where
-    signatory terms.issuer, terms.av
+    signatory terms.seller, terms.av
     observer terms.ao
 
     nonconsuming choice Ended_CloseBid : ContractId Outcome
@@ -593,19 +593,20 @@ template EndedRound with
       controller terms.av
       do exercise sale CloseSaleWithoutSale with reason
 
-ticketFor : Terms -> [Party] -> LockBinding -> LockBinding -> Text -> Update (ContractId RecoveryTicket)
-ticketFor t parties lock receipt reason = create $ RecoveryTicket t.av t.ao parties lock receipt reason
+ticketFor : Terms -> Party -> LockBinding -> LockBinding -> Text -> Update (ContractId RecoveryTicket)
+ticketFor t owner lock receipt reason = create $ RecoveryTicket t.av t.ao owner lock receipt reason
 
+-- The owner tracks recovery with ao. Providers see the registry's asset release.
 template RecoveryTicket with
     av : Party
     ao : Party
-    parties : [Party]
+    owner : Party
     lock : LockBinding
     receipt : LockBinding
     reason : Text
   where
     signatory av
-    observer ao, parties
+    observer ao, owner
 
     choice Recover : [ContractId H.Holding]
       with current : AllocationId; receipt : AllocationId; fundingArgs : ExtraArgs; receiptArgs : ExtraArgs

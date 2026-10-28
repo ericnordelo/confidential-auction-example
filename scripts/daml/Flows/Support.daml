@@ -19,7 +19,7 @@ import Flows.Fixtures
 
 data Env = Env with
     terms : Terms
-    issuerProvider : Party
+    sellerProvider : Party
     alice : Party
     aliceProvider : Party
     bob : Party
@@ -45,9 +45,13 @@ setup = setupWith allocateParty
 
 -- Network demonstrations supply an allocator that routes each role to its host.
 setupWith : (Text -> Script Party) -> Text -> Bool -> Script Env
-setupWith allocate prefix requireApproval = do
-  issuer <- allocate (prefix <> "-issuer")
-  issuerProvider <- allocate (prefix <> "-issuer-provider")
+setupWith = setupWithProviderPolicy (PartyConfig True True)
+
+-- Providers can require a separate approval or authorize the owner in advance.
+setupWithProviderPolicy : PartyConfig -> (Text -> Script Party) -> Text -> Bool -> Script Env
+setupWithProviderPolicy providerPolicy allocate prefix requireApproval = do
+  seller <- allocate (prefix <> "-seller")
+  sellerProvider <- allocate (prefix <> "-seller-provider")
   av <- allocate (prefix <> "-validation")
   ao <- allocate (prefix <> "-operator")
   eligibilityProvider <- allocate (prefix <> "-eligibility")
@@ -66,17 +70,17 @@ setupWith allocate prefix requireApproval = do
   Some tokenDisclosure <- queryDisclosure @TokenRules tokenAdmin tokenRules
   -- Account policies are agreed once. Allocation instructions can later collect
   -- the owner and provider approvals in separate registry transactions.
-  let inventory = H.Account (Some issuer) (Some issuerProvider) "inventory"
-      proceeds = H.Account (Some issuer) (Some issuerProvider) "proceeds"
+  let inventory = H.Account (Some seller) (Some sellerProvider) "inventory"
+      proceeds = H.Account (Some seller) (Some sellerProvider) "proceeds"
       payment = H.Account (Some alice) (Some aliceProvider) "payment"
       delivery = H.Account (Some alice) (Some aliceProvider) "delivery"
-  cashAccounts <- mapA (createAccountConfig cashAdmin) [proceeds, payment]
-  tokenAccounts <- mapA (createAccountConfig tokenAdmin) [inventory, delivery]
+  cashAccounts <- mapA (createAccountConfigWithPolicy providerPolicy cashAdmin) [proceeds, payment]
+  tokenAccounts <- mapA (createAccountConfigWithPolicy providerPolicy tokenAdmin) [inventory, delivery]
   grants <- forA [Preparation, Opening, Admission, Closing, Clearing, Termination, Recovery] $ \kind -> do
     cid <- submit av do createCmd Grant with av; ao; kind
     pure (kind, cid)
   let terms = Terms with
-        issuer; av; ao; eligibilityProvider; cashAdmin; tokenAdmin; cashRules; tokenRules
+        seller; av; ao; eligibilityProvider; cashAdmin; tokenAdmin; cashRules; tokenRules
         settlementAttester = if requireApproval then Some attester else None
         cashInstrument = "USD"
         tokenInstrument = "ISSUE"
@@ -91,15 +95,18 @@ setupWith allocate prefix requireApproval = do
         maxBids = 16
         maxBatch = 8
   pure Env with
-    terms; issuerProvider; alice; aliceProvider; bob; carol; outsider; attester; grants
+    terms; sellerProvider; alice; aliceProvider; bob; carol; outsider; attester; grants
     disclosures = cashDisclosure :: tokenDisclosure :: map snd (cashAccounts <> tokenAccounts)
     staticDisclosures = cashDisclosure :: tokenDisclosure :: map snd (cashAccounts <> tokenAccounts)
     start; cashConfigs = map fst cashAccounts; tokenConfigs = map fst tokenAccounts
 
 
 createAccountConfig : Party -> H.Account -> Script (ContractId AccountConfig, Disclosure)
-createAccountConfig admin account = do
-  let config = AccountConfig admin account (PartyConfig True True) (PartyConfig True True)
+createAccountConfig = createAccountConfigWithPolicy (PartyConfig True True)
+
+createAccountConfigWithPolicy : PartyConfig -> Party -> H.Account -> Script (ContractId AccountConfig, Disclosure)
+createAccountConfigWithPolicy providerPolicy admin account = do
+  let config = AccountConfig admin account (PartyConfig True True) providerPolicy
   Some provider <- pure account.provider
   Some owner <- pure account.owner
   proposal <- submit provider do createCmd $ AccountProposal config
@@ -137,22 +144,22 @@ mint e cash account amount = do
   Some disclosure <- queryDisclosure @Token admin cid
   pure (toInterfaceContractId cid, disclosure)
 
--- Basic issuer accounts finish both requests with the owner's authority alone.
-basicIssuerAccounts : Env -> Env
-basicIssuerAccounts e = e with
+-- Basic seller accounts finish both requests with the owner's authority alone.
+basicSellerAccounts : Env -> Env
+basicSellerAccounts e = e with
   terms = e.terms with
     inventory = e.terms.inventory with provider = None
     proceeds = e.terms.proceeds with provider = None
 
--- The issuer submits alone. A live grant and registry context provide visibility.
+-- The seller submits alone. A live grant and registry context provide visibility.
 submitRoundFunding : Env -> ContractId RoundPreparation -> [ContractId H.Holding] -> Script RoundSource
 submitRoundFunding e preparation inputs = do
-  awaitVisible e.terms.issuer preparation
+  awaitVisible e.terms.seller preparation
   Some preparationDisclosure <- queryDisclosure @Grant e.terms.av (grant e Preparation)
   inputDisclosures <- forA inputs $ \cid -> do
     Some disclosure <- queryDisclosure @Token e.terms.tokenAdmin (fromInterfaceContractId cid)
     pure disclosure
-  submit (actAs e.terms.issuer <> discloseMany (preparationDisclosure :: inputDisclosures <> e.staticDisclosures)) do
+  submit (actAs e.terms.seller <> discloseMany (preparationDisclosure :: inputDisclosures <> e.staticDisclosures)) do
     exerciseCmd preparation FundRound with
       preparation = grant e Preparation; inputs; cashArgs = cashContext e; tokenArgs = tokenContext e
 

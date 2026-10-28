@@ -50,7 +50,7 @@ cancelledPaymentBlocksClear = do
   submitMustFail (actAs e.terms.ao <> readAs e.terms.av <> discloseMany e.disclosures) do
     exerciseCmd (grant e Clearing) ClearRound with round = closed; input
   assertActive e.terms.av closed
-  balance e.terms.issuer e.terms.proceeds e.terms.cashInstrument False >>= (=== 0.0)
+  balance e.terms.seller e.terms.proceeds e.terms.cashInstrument False >>= (=== 0.0)
   balance e.alice (bidTerms e e.alice 5 12.0).delivery e.terms.tokenInstrument False >>= (=== 0.0)
 
 -- Missing Splice account context makes the second registry fail AFTER cash
@@ -85,13 +85,13 @@ atomicRollbackAndRetry = do
   assertActive t.av (fromInterfaceContractId @TokenAllocationV2 bid.currentReceipt)
   assertActive t.av (fromInterfaceContractId @TokenAllocationV2 receipt)
   assertActive t.av approval
-  balance t.issuer t.proceeds t.cashInstrument False >>= (=== 0.0)
+  balance t.seller t.proceeds t.cashInstrument False >>= (=== 0.0)
   balance e.alice bidTermsA.payment t.cashInstrument True >>= (=== 600.0)
   query @Outcome e.alice >>= (\xs -> length xs === 0)
 
   -- A retry supplies the actual upstream account policies and event log.
   _ <- clearRound e closed (input with tokenArgs = tokenContext e)
-  balance t.issuer t.proceeds t.cashInstrument False >>= (=== 400.0)
+  balance t.seller t.proceeds t.cashInstrument False >>= (=== 400.0)
   balance e.alice bidTermsA.delivery t.tokenInstrument False >>= (=== 50.0)
   assertGone t.av approval
 

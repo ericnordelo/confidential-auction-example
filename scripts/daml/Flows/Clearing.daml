@@ -19,7 +19,7 @@ happyPath = do
       a = bidTerms e e.alice 5 12.0
       b = bidTerms e e.bob 8 10.0
       c = bidTerms e e.carol 4 10.0
-  -- The issuer and provider approve inventory funding. ao then opens the round.
+  -- The seller and provider approve inventory funding. ao then opens the round.
   (r0, published, supply) <- openRound e
   Some initialRound <- queryContractId e.terms.av r0
   let receipt = initialRound.proceedsReceipt.root
@@ -49,8 +49,8 @@ happyPath = do
     balance bid.bidder bid.delivery t.tokenInstrument False >>= (=== tokens)
     balance bid.bidder bid.payment t.cashInstrument False >>= (=== refund)
     balance bid.bidder bid.payment t.cashInstrument True >>= (=== 0.0)
-  balance t.issuer t.proceeds t.cashInstrument False >>= (=== 1000.0)
-  balance t.issuer t.inventory t.tokenInstrument False >>= (=== 0.0)
+  balance t.seller t.proceeds t.cashInstrument False >>= (=== 1000.0)
+  balance t.seller t.inventory t.tokenInstrument False >>= (=== 0.0)
   assertGone t.av closed
   debug "Atomic clear complete: every cash payment and token delivery committed."
 
@@ -78,7 +78,7 @@ zeroFill = forA_ [False, True] $ \custody -> do
   balance loserTerms.bidder loserTerms.payment t.cashInstrument True >>= (=== 0.0)
   balance loserTerms.bidder loserTerms.delivery t.tokenInstrument False >>= (=== 0.0)
   balance winnerTerms.bidder winnerTerms.delivery t.tokenInstrument False >>= (=== 100.0)
-  balance t.issuer t.proceeds t.cashInstrument False >>= (=== 1200.0)
+  balance t.seller t.proceeds t.cashInstrument False >>= (=== 1200.0)
   query @TokenAllocationV2 t.av >>= (\xs -> length xs === 0)
   query @RecoveryTicket t.av >>= (\xs -> length xs === 0)
   query @AcceptedBid t.av >>= (\xs -> length xs === 0)
@@ -124,7 +124,7 @@ noWinners = do
   forA_ [(aliceTerms,600.0),(bobTerms,300.0)] $ \(bid, reserved) -> do
     balance bid.bidder bid.payment t.cashInstrument False >>= (=== 0.0)
     balance bid.bidder bid.payment t.cashInstrument True >>= (=== reserved)
-  balance t.issuer t.inventory t.tokenInstrument True >>= (=== 100.0)
+  balance t.seller t.inventory t.tokenInstrument True >>= (=== 100.0)
   query @Outcome t.av >>= (\xs -> length xs === 0)
   query @RecoveryTicket t.av >>= (\xs -> length xs === 0)
 
@@ -140,9 +140,9 @@ noWinners = do
     balance bid.bidder bid.payment t.cashInstrument False >>= (=== reserved)
     balance bid.bidder bid.payment t.cashInstrument True >>= (=== 0.0)
     balance bid.bidder bid.delivery t.tokenInstrument False >>= (=== 0.0)
-  balance t.issuer t.inventory t.tokenInstrument False >>= (=== 100.0)
-  balance t.issuer t.inventory t.tokenInstrument True >>= (=== 0.0)
-  balance t.issuer t.proceeds t.cashInstrument False >>= (=== 0.0)
+  balance t.seller t.inventory t.tokenInstrument False >>= (=== 100.0)
+  balance t.seller t.inventory t.tokenInstrument True >>= (=== 0.0)
+  balance t.seller t.proceeds t.cashInstrument False >>= (=== 0.0)
   query @TokenAllocationV2 t.av >>= (\xs -> length xs === 0)
   query @RecoveryTicket t.av >>= (\xs -> length xs === 0)
   query @AcceptedBid t.av >>= (\xs -> length xs === 0)
@@ -152,7 +152,7 @@ noWinners = do
   submitMustFail (actAs t.ao <> readAs t.av <> discloseMany e.disclosures) do
     exerciseCmd (grant e Clearing) ClearRound with round = closed; input = approved
 
--- Even without accepted bids, settle both issuer allocations with empty sides.
+-- Even without accepted bids, settle both seller allocations with empty sides.
 emptyRound : Script ()
 emptyRound = do
   e <- setup "empty" False
@@ -164,9 +164,9 @@ emptyRound = do
   cleared <- clearRound e closed input
   Some c <- queryContractId e.terms.av cleared
   c.result === Result e.terms.reserve []
-  balance e.terms.issuer e.terms.inventory e.terms.tokenInstrument False >>= (=== 100.0)
-  balance e.terms.issuer e.terms.inventory e.terms.tokenInstrument True >>= (=== 0.0)
-  balance e.terms.issuer e.terms.proceeds e.terms.cashInstrument False >>= (=== 0.0)
+  balance e.terms.seller e.terms.inventory e.terms.tokenInstrument False >>= (=== 100.0)
+  balance e.terms.seller e.terms.inventory e.terms.tokenInstrument True >>= (=== 0.0)
+  balance e.terms.seller e.terms.proceeds e.terms.cashInstrument False >>= (=== 0.0)
   query @TokenAllocationV2 e.terms.av >>= (\xs -> length xs === 0)
   query @RecoveryTicket e.terms.av >>= (\xs -> length xs === 0)
   assertGone e.terms.av closed

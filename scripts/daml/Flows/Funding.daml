@@ -7,12 +7,12 @@ import Auction.Assets
 import Auction.Workflow
 import Flows.Support
 
--- Only the issuer can request round funding. A failure in proceeds creation
+-- Only the seller can request round funding. A failure in proceeds creation
 -- rolls back inventory locking, and a successful request consumes its preparation.
 roundFundingGuards : Script ()
 roundFundingGuards = do
   initial <- setup "round-funding-guards" False
-  let e = basicIssuerAccounts initial
+  let e = basicSellerAccounts initial
       t = e.terms
   preparation <- submit (actAs t.ao <> readAs t.av) do
     exerciseCmd (grant e Preparation) StartRound with terms = t
@@ -21,40 +21,40 @@ roundFundingGuards = do
   let disclosures = [grantDisclosure,smallDisclosure] <> e.staticDisclosures
       args = FundRound (grant e Preparation) [small] (cashContext e) (tokenContext e)
   submitMustFail (actAs t.ao <> readAs t.av <> discloseMany disclosures) do exerciseCmd preparation args
-  submitMustFail (actAs e.issuerProvider <> discloseMany disclosures) do exerciseCmd preparation args
-  submitMustFail (actAs t.issuer <> discloseMany disclosures) do exerciseCmd preparation args
+  submitMustFail (actAs e.sellerProvider <> discloseMany disclosures) do exerciseCmd preparation args
+  submitMustFail (actAs t.seller <> discloseMany disclosures) do exerciseCmd preparation args
   assertActive t.av preparation
   assertActive t.tokenAdmin (fromInterfaceContractId @Token small)
-  balance t.issuer t.inventory t.tokenInstrument True >>= (=== 0.0)
+  balance t.seller t.inventory t.tokenInstrument True >>= (=== 0.0)
 
   (rest,restDisclosure) <- mint e False t.inventory 1.0
   let completeArgs = args with inputs = [small,rest]
       completeDisclosures = restDisclosure :: disclosures
   -- Inventory would lock 100, but the second registry lacks its event-log context.
-  submitMustFail (actAs t.issuer <> discloseMany completeDisclosures) do
+  submitMustFail (actAs t.seller <> discloseMany completeDisclosures) do
     exerciseCmd preparation (completeArgs with cashArgs = extra)
   assertActive t.av preparation
   assertActive t.tokenAdmin (fromInterfaceContractId @Token small)
   assertActive t.tokenAdmin (fromInterfaceContractId @Token rest)
-  balance t.issuer t.inventory t.tokenInstrument True >>= (=== 0.0)
+  balance t.seller t.inventory t.tokenInstrument True >>= (=== 0.0)
   query @Proposal t.av >>= (\xs -> length xs === 0)
   query @RoundFundingRequest t.av >>= (\xs -> length xs === 0)
   -- An admission grant does not authorize preparation, even for the same parties.
   Some wrongGrant <- queryDisclosure @Grant t.av (grant e Admission)
-  submitMustFail (actAs t.issuer <> discloseMany (wrongGrant :: completeDisclosures)) do
+  submitMustFail (actAs t.seller <> discloseMany (wrongGrant :: completeDisclosures)) do
     exerciseCmd preparation (completeArgs with preparation = grant e Admission)
   FundedRound proposal <- submitRoundFunding e preparation [small,rest]
   assertGone t.av preparation
   assertActive t.av proposal
   another <- submit (actAs t.ao <> readAs t.av) do
     exerciseCmd (grant e Preparation) StartRound with terms = t
-  submitMustFail (actAs t.issuer <> discloseMany completeDisclosures) do exerciseCmd another completeArgs
+  submitMustFail (actAs t.seller <> discloseMany completeDisclosures) do exerciseCmd another completeArgs
   -- Funding at the bidding cutoff is too late, even with fresh inventory.
   (fresh,freshDisclosure) <- mint e False t.inventory 100.0
   setTime t.biddingDeadline
-  submitMustFail (actAs t.issuer <> discloseMany (freshDisclosure :: disclosures)) do
+  submitMustFail (actAs t.seller <> discloseMany (freshDisclosure :: disclosures)) do
     exerciseCmd another (args with inputs = [fresh])
-  submit t.issuer do exerciseCmd another AbandonRoundPreparation
+  submit t.seller do exerciseCmd another AbandonRoundPreparation
   assertGone t.av another
 
 -- Immediate allocation rejects insufficient funds. Failure in the second
